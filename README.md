@@ -1,10 +1,6 @@
-# subcellular-proteomics-AD-Resilience
+# subcellular-proteomics-AD-Resilience: Analysis code
 Analysis code accompanying our study of subcellular proteomics in ROSMAP samples
-
-# Analysis code accompanying the manuscript
-
-This repository contains R Markdown analysis code for a study of subcellular
-proteomics in ROSMAP samples. Scripts are being prepared for manuscript submission.
+This repository contains R Markdown workflow for a study of subcellular proteomics in ROSMAP samples. Scripts are being prepared for manuscript submission.
 
 ## Analysis index
 
