@@ -17,7 +17,7 @@ data-use agreements, through [Rush Alzheimer's Disease Center](https://www.radc.
 
 ## Protein matrix QC workflow
 
-The script imports DIA-NN protein-group intensities, maps runs to the experimental layout, removes excluded samples and contaminants, filters proteins with at least 70% missingness, removes entries listing multiple accessions or genes, transforms intensities to log2 scale, and applies MAI imputation. The supplementary PCA uses imputed intensities and is centred but not scaled to unit variance.
+The script imports DIA-NN protein-group intensities, maps runs to the experimental layout, removes excluded samples and contaminants, filters proteins with at least 70% missingness, removes entries listing multiple accessions or genes, transforms intensities to log2 scale, and applies MAI imputation.
 
 Configure `data_dir` and `output_dir` in the script. The current code reads:
 
