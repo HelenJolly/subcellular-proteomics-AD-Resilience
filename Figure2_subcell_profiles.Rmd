@@ -1,0 +1,682 @@
+---
+title: "Figure 2: Subcellular organisation and profile reproducibility"
+output: html_document
+---
+
+## Analysis code for results relating to Figure 2 
+
+```{r display-settings, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Inputs
+
+- `data/MAI_prot_model_new.rds`: processed SummarizedExperiment from protein_matrix_QC,
+  containing the log2-scaled unimputed and `MAI_imputed` assay and protein/run metadata.
+  
+- `data/merged_markers_filtered.csv`: the final curated marker set. 
+
+- The original `demogs` dataset contains `Subject`, `Group`(CON/RES/AD/DEM), `age_death`, `pmi`, `study`, and `msex` and is external to this analysis*. Instead, use the subject_group.csv file provided to map subject to disease group, which only contains disease category (CON/RES/AD/DEM).
+
+-  `prop_long` object is derived using the above to generate marker profiles
+  
+*Subject-level inputs and generated objects are not distributed with the public
+code. ROSMAP participant-level clinical and neuropathological data can be requested through the Rush Alzheimer’s Disease Center at https://www.radc.rush.edu and AD Knowledge Portal at https://www.synapse.org, subject to the applicable data-use agreements. 
+
+
+## Prepare protein intensities and subject-normalised profiles
+
+
+```{r prepare-profiles}
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+
+data_dir <- "path/to/directory"
+
+# Load the processed protein matrix.
+se_log2_07 <- readRDS(file.path(data_dir, "MAI_prot_model_new.rds"))
+se_log2_07 #summarizedExperiment, with global filter of <0.7 missingness, unimputed and MAI_imputed stored here (both log-scaled)
+
+# 2) Extract the imputed assay data and back-transform 
+# - Imputed matrix is used
+
+MAI_raw <- 2^(assay(se_log2_07, "MAI_imputed")) %>% #log-scaled currently, so back-transform to raw-intensities
+  as.data.frame() %>% #convert to dataframe
+  rownames_to_column("feature_id") %>% #set proteins as a column
+  pivot_longer(-feature_id, names_to = "SampleID", values_to = "value") #pivot long
+
+# 3) extract row/col metadata from summarizedExperiment
+rd <- rowData(se_log2_07) %>% as.data.frame() %>% rownames_to_column("feature_id") #protein metadata
+cd <- colData(se_log2_07) %>% as.data.frame() %>% rownames_to_column("SampleID") #sample metadata
+
+# sample-category (this ONLY includes disease status for subjects)
+demogs <- readr::read_csv(file.path(data_dir, "subject_group.csv"), show_col_types = FALSE)
+
+# 4) Join metadata to assay
+long <- MAI_raw %>% #join long assays with row data
+  left_join(rd, by = "feature_id") %>%
+  left_join(cd, by = "SampleID") %>%
+  left_join(demogs %>% select(Subject, Group), by = "Subject")
+
+glimpse(long) #check result
+
+#sum normalise
+prop <- long %>%
+  mutate(log2Quant = log2(value)) %>%
+  group_by(Subject, feature_id) %>%
+  mutate(sum = sum(value, na.rm = TRUE),
+         prop = value / sum) %>%
+  ungroup()
+```
+
+
+## Figure 2A: Mean profiles and Ward D2 clustering
+
+Subject-protein intensities are sum-normalised, then the cohort-mean profile is derived. 
+Each mean protein profile is row-z-scaled. Euclidean distance and Ward's D2 clustering are used, 
+with the dendrogram cut at k=15 clusters. 
+
+```{r ward-clustering-and-heatmap}
+library(tibble)
+library(ggplot2)
+
+#1) generate mean matrix (the cohort mean of protein fractionation profiles) 
+prot_frac_mean <- prop %>%
+  mutate(Fraction = factor(Fraction, levels = c("1","2","3","4","5","6","7"))) %>% #order
+  group_by(feature_id, Fraction) %>% #group by protein-fraction
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop")
+
+#2) pivot wide: proteins × fractions
+prop_mat <- prot_frac_mean %>%
+  pivot_wider(names_from = Fraction, values_from = mean_prop) %>%
+  arrange(feature_id) %>%
+  column_to_rownames("feature_id") %>% # proteins as rownames, fractions as columns
+  as.matrix() #mean proportional protein matrix
+
+#3) z-score rows (each protein across fractions). 
+prot_z <- t(scale(t(prop_mat)))  # mean=0, sd=1 per protein
+
+#4) Hierarchical clustering of profiles, K = 15
+d <- dist(prot_z) 
+hc <- hclust(d, method = "ward.D2")
+clusters <- cutree(hc, k = 15)
+
+#5) save as dataframe
+cluster_df <- tibble(feature_id = rownames(prot_z), cluster = factor(sprintf("%02d", clusters)))
+cluster_df %>% group_by(cluster) %>% summarise(n = n(), .groups = "drop") #summary
+
+#6) make heatmap
+cluster_df <- cluster_df[match(rownames(prot_z), cluster_df$feature_id), ]
+
+# order proteins by cluster in the matrix (so blocks are visible)
+prot_z_ord <- prot_z[order(cluster_df$cluster), ]
+ann_row <- data.frame(Cluster = cluster_df$cluster[order(cluster_df$cluster)])
+rownames(ann_row) <- rownames(prot_z_ord)
+
+library(paletteer)
+# z-score heatmap colours (divergent gradient)
+heat_cols <- paletteer_c("grDevices::Cork", 30)
+cluster_levels <- levels(cluster_df$cluster)
+cluster_cols <- paletteer_d("ggthemes::calc", 12) 
+#extend 12-colour palette to 15 colours
+extra_cols <- c("#D02090","#00CDCD", "#9B30FF") 
+cluster_cols <- c(cluster_cols, extra_cols)
+
+cluster_cols <- setNames(cluster_cols, cluster_levels)
+
+library(ComplexHeatmap)
+library(circlize)
+col_fun <- colorRamp2( #extract colour palette
+  seq(min(prot_z_ord, na.rm = TRUE), 
+      max(prot_z_ord, na.rm = TRUE), 
+      length.out = length(heat_cols)),  heat_cols)
+row_ha <- rowAnnotation( #assign colours to clusters
+  Cluster = ann_row$Cluster,
+  col = list(Cluster = cluster_cols),
+  show_annotation_name = FALSE)
+
+#plot heatmap
+ht <- Heatmap(
+  prot_z_ord,
+  name = "z-score",
+  col = col_fun,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  column_title = "Protein fractionation profile clustering",
+  right_annotation = row_ha)
+
+#add legends
+draw(ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  merge_legends = FALSE,
+  legend_grouping = "original")
+```
+
+
+## Figure 2A: GO cellular-component enrichment
+
+The background comprises the clustered protein IDs. Original enrichment and
+term-selection settings are preserved, including the second BH adjustment over
+the returned, fold-enrichment-filtered terms. This is not an adjustment over
+all GO tests originally performed. Annotation/package versions are required
+for exact reproduction.
+
+**Unresolved plot metric:** the original lollipop code maps `Signal` to the
+x-axis while labelling it "Strength". `Strength = log10(FoldEnrichment)`;
+`Signal` combines Strength with adjusted significance. The source expression
+is retained here pending confirmation of which metric generated Figure 2A.
+
+
+```{r go-enrichment}
+## Extract uniprot codes for GO analysis
+uniprot_codes <- rd %>% dplyr::select(Genes, Protein.Group) %>% distinct() %>% 
+  rename(feature_id = Protein.Group)
+#cluster_df <- cluster_df %>% left_join(uniprot_codes, by = c("feature_id"))
+
+## generate background set
+bg_uniprot <- cluster_df %>% filter(!is.na(feature_id)) %>% pull(feature_id) %>% unique()
+
+## 3) Split UniProt IDs by cluster (generate cluster input sets)
+cluster_genes <- cluster_df %>% 
+  left_join(uniprot_codes, by = "feature_id") %>%
+  filter(!is.na(feature_id)) %>%
+  group_by(cluster) %>% reframe(feature_id = unique(feature_id)) %>%
+  split(.$cluster) %>% lapply(\(df) df$feature_id)
+
+### GO:CC
+library(clusterProfiler)
+library(org.Hs.eg.db) #homo sapiens
+
+ego_list <- lapply(names(cluster_genes), function(clust){ #for each cluster
+  # skip small clusters
+  if (length(cluster_genes[[clust]]) < 20) return(NULL)
+  
+ ego <- enrichGO( #make this table
+    gene          = cluster_genes[[clust]], #the genes in the cluster
+    universe      = bg_uniprot,   #background universe = all unique proteins in matrix
+    OrgDb         = org.Hs.eg.db,   #organism database
+    keyType       = "UNIPROT",    #Uniprot IDs
+    ont           = "CC",  #cell component (GO:CC sets)
+    pAdjustMethod = "BH",   #benj-hoch FDR adjustment
+    qvalueCutoff  = 0.05,    #q-value cutoff
+    readable      = TRUE)
+  
+  #If there are no enriched terms for this cluster, return NULL
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) return(NULL)
+  
+  df <- as.data.frame(ego)      # <-- this pulls out the table you printed
+  df$cluster <- clust #add cluster ID
+  df 
+})
+```
+
+- Function to extract GO terms
+```{r select-go-terms}
+library(dplyr)
+library(purrr)
+library(stringr)
+
+top_terms <- function(ego_list, n_terms , fdr_thresh , FE_min , Count_thresh ) {
+  ### arguments = GO cluster list, number of terms to select, FDR threshold, min fold enrich, min members
+
+  go_all <- purrr::list_rbind(ego_list) %>% #combine all clusters into one dataframe
+    
+    #record cluster metadata
+    mutate(cluster = sprintf("%02d", as.integer(cluster)),
+      Count = as.integer(Count), #number of entries
+      pvalue = as.numeric(pvalue),
+      FoldEnrichment = as.numeric(FoldEnrichment)) %>%
+    #filter for fold enrichment (FE_min) above threshold argument
+    filter(!is.na(pvalue), !is.na(FoldEnrichment), FoldEnrichment > FE_min) %>%
+    
+    #calculate global FDR (all combined clusters) and strength
+    mutate(FDR_global = p.adjust(pvalue, method = "BH"),
+      FDR_global = pmax(FDR_global, .Machine$double.xmin),
+      ScaledFE = log10(FoldEnrichment), 
+      FDR_term = -log10(FDR_global),
+      #harmonic mean prioritises terms with both strong enrichment and statistical support
+      Strength = 2 * ScaledFE * FDR_term / (ScaledFE + FDR_term)) %>% 
+    #then filter according to arguments
+    filter(FDR_global < fdr_thresh, Count > Count_thresh) %>%
+    
+    #make sure no Gene set matches are repeated by keeping the top one
+    group_by(geneID) %>% 
+    arrange(desc(ScaledFE), .by_group = TRUE) %>% slice_head(n = 1) %>%
+    ungroup() %>%
+    
+    #make sure no Descriptions are repeated by keeping the top one
+    group_by(Description) %>% 
+    arrange(desc(ScaledFE), .by_group = TRUE) %>% slice_head(n = 1) %>%
+    ungroup() %>%
+    
+    #Rank by enrichment, count within cluster
+    group_by(cluster) %>%
+    arrange(desc(ScaledFE), desc(Count), .by_group = TRUE) %>% 
+    slice_head(n = n_terms) %>% #take top n terms here in order they'll be shown
+    ungroup() %>%
+    
+    #arrange
+    arrange(cluster, desc(ScaledFE), Count) %>%
+    relocate(cluster, .before = 1)
+
+  go_all
+}
+```
+
+### This chunk below extracts the top 2 GO:CC terms per cluster at:
+- global FDR < 0.05
+- fold enrichment > 1.5
+- with at least 20 pathway entries
+- the go_top function also removes any redundant descriptions (keeps the strongest)
+
+```{r go-lollipop-plot}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+library(tidytext)
+
+go_top <- top_terms(ego_list, n_terms = 2, fdr_thresh = 0.05, FE_min = 1.5, Count_thresh = 20)
+
+# ---- top 2 largest terms per cluster ----
+plot_df <- go_top %>%
+  group_by(cluster) %>%
+  arrange(desc(Strength), .by_group = TRUE) %>%
+  ungroup() %>%
+  mutate(
+    cluster = factor(cluster, levels = sprintf("%02d", 1:15)),
+    term = Description,
+    term = tidytext::reorder_within(term, Strength, cluster))
+
+# ---- size legend breaks: rounded to nearest 5 across the plotted data ----
+min_k <- min(plot_df$Count, na.rm = TRUE)
+max_k <- max(plot_df$Count, na.rm = TRUE)
+min_k5 <- floor(min_k / 5) * 5
+max_k5 <- ceiling(max_k / 5) * 5
+size_breaks <- unique(round(seq(min_k5, max_k5, length.out = 5) / 5) * 5)
+size_breaks <- size_breaks[size_breaks >= min_k5 & size_breaks <= max_k5]
+
+library(stringr)
+plot_df$term <- str_wrap(plot_df$term, width = 50)
+
+
+# ---- plot ----
+ggplot(plot_df, aes(x = Strength, y = term, color = cluster)) +
+  geom_segment(aes(x = 0, xend = Strength, yend = term), linewidth = 0.8, alpha = 0.9) +
+  geom_point(aes(size = Count), alpha = 0.6) +
+  #geom_text(aes(label = formatC(FDR_global, format = "e", digits = 0)), color = "grey20", size = 1, hjust = -0.3, fontface = "bold") +
+  facet_wrap(~ cluster, ncol = 1, scales = "free_y") +
+  tidytext::scale_y_reordered(position = "right") +
+  scale_color_manual(values = cluster_cols, guide = "none") +
+  scale_size_continuous(
+    name   = "count",
+    range  = c(1, 7),
+    breaks = size_breaks,
+    limits = c(min_k5, max_k5)) +
+  labs(x = "Strength", y = NULL, title = "GO:CC Strength by cluster") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "right", panel.spacing.y = unit(0.2, "lines"),
+    plot.title = element_text(size = 14, face = "bold", colour = "black"),
+    strip.background = element_blank(),
+    strip.text = element_blank(), 
+    axis.text.y = element_text(size = 12, face = "italic")) +
+  coord_cartesian(clip = "off") +
+  guides(size = guide_legend(override.aes = list(alpha = 1)))
+```
+
+
+## Marker input
+
+Load the final assignments produced by the separate curation workflow. The
+source Rmd also filtered and reassigned entries after loading the CSV; these
+steps are intentionally excluded. The input supplied here must already contain
+the final assignments used for the figure.
+
+
+```{r load-markers}
+library(readr)
+all_markers_final <- read_csv(file.path(data_dir, "merged_markers_filtered.csv"), show_col_types = FALSE)
+
+marker_palette <- c(
+  "Secretory Pathway"     = "#FFD700",
+  "Plasma Membrane"       = "#778B00",
+  "Cytosol"               = "#00E2E5",
+  "Cytoskeleton"          = "#FF0010",
+  "Presynapse"            = "#DEA0FD",
+  "Postsynapse"           = "#C8308C",
+  "Peroxisome"            = "#6A33C2",
+  "Mitochondria"          = "#9DCC00",
+  "Nucleus"               = "navy",
+  "Ribosome"              = "#0075DC",
+  "Proteasome"            = "#8B3B00")
+
+plot_palette <- c(marker_palette, "unknown" = "grey80")
+```
+
+
+## Marker profiles: Supplementary Figure S2
+
+```{r marker-profiles}
+final_profiles <- prop %>% 
+  inner_join(all_markers_final %>% dplyr::select(Protein.Group, markers) %>% 
+               distinct(), by = "Protein.Group") %>%
+  mutate(Fraction = factor(Fraction, levels = c("1","2","3","4","5","6","7"))) %>%
+  group_by(markers, Protein.Group, Fraction) %>%
+  summarise(
+    n = sum(!is.na(prop)),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sdev = sd(prop, na.rm = TRUE),
+    sem = sdev / sqrt(n),
+    .groups = "drop")
+
+ggplot(final_profiles, #then do the same again for log
+  aes(x = Fraction, y = mean_prop, group = Protein.Group, color = markers)) +
+  geom_line(alpha = 0.3, linewidth = 0.7) +
+  scale_color_manual(values = marker_palette) +
+  labs(title = "Compartment class marker profiles",
+       subtitle = "Mean proportional abundance across subjects",
+       x = "Fraction", y = "Mean proportional abundance",
+       color = "Consensus class") +
+  facet_wrap(~markers, ncol = 4, scales = "fixed") +
+  theme_classic(base_family = "Helvetica") +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"), #bold facet labels
+    plot.title = element_text(face = "bold"), #bold title
+    legend.position = "none")
+```
+
+
+## Figure 2Ci: Compartment mean profiles and SEM
+
+```{r}
+overall_profile <- final_profiles %>%
+  #filter(markers %in% c("Cytoskeleton", "Cytosol")) %>% #include for the MAPT peptide figure 5
+  group_by(markers, Fraction) %>%
+  summarise(
+    n = n(),
+    overall_mean = mean(mean_prop, na.rm = TRUE),
+    sd = sd(mean_prop, na.rm = TRUE),
+    sem = sd / sqrt(n),
+    .groups = "drop")
+
+ggplot(overall_profile,
+  aes(x = Fraction, y = overall_mean, group = markers)) +
+  geom_ribbon(aes(ymin = overall_mean - sem,
+        ymax = overall_mean + sem,
+        fill = markers), alpha = 0.25) +
+  geom_line(aes(color = markers), linewidth = 0.8) +
+  scale_color_manual(values = marker_palette) +
+  scale_fill_manual(values = marker_palette) +
+  labs(title = "", subtitle = "",
+    x = "Fraction", y = "Mean proportional abundance +/-SEM",
+    color = "Compartment", fill = "Compartment") +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "none",
+    plot.title = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 10))
+```
+
+
+## Figure 2Cii: Nuclear/cytosolic and pre-/postsynaptic profiles
+
+The same source `final_profiles` table is used below, so the group-averaging
+question above also applies to these panels.
+
+
+```{r paired-marker-profiles}
+cii <- final_profiles %>%
+  filter(markers %in% c(
+    "Nucleus", "Cytosol",
+    "Presynapse", "Postsynapse")) %>%
+  mutate(panel = case_when(
+    markers %in% c("Nucleus", "Cytosol") ~ "Nucleus vs Cytosol",
+    markers %in% c("Presynapse", "Postsynapse") ~ "Pre vs Post synapse"))
+
+ggplot(cii,
+  aes(x = as.numeric(Fraction), y = mean_prop, group = Protein.Group, colour = markers)) +
+  geom_line(alpha = 0.8, linewidth = 0.4) +
+  scale_color_manual(values = marker_palette) +
+  scale_x_continuous(breaks = 1:7) +
+  labs(
+    title = "Marker fractionation profiles",
+    x = "Fraction", y = "Mean proportional abundance") +
+  facet_wrap(~panel, ncol = 1) +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "none",
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10, face = "bold"),
+    panel.spacing = unit(0.6, "lines"))
+```
+
+
+## Figure 2Ciii: t-SNE (input provenance unresolved)
+
+
+
+```{r tsne}
+#T-sne 
+library(Rtsne)
+
+## Optional but recommended:
+## scale fractions so t-SNE is not dominated by one fraction.
+mat_scaled <- scale(prop_mat)
+
+## ---- 8) Run t-SNE ----
+set.seed(3)
+tsne_out <- Rtsne(mat_scaled, dims = 2, perplexity = 50, theta = 0.5, pca = TRUE, check_duplicates = FALSE)
+
+## ---- 9) t-SNE coordinates + labels ----
+df_tsne <- as.data.frame(tsne_out$Y) %>%
+  setNames(c("tSNE1", "tSNE2")) %>% rownames_to_column("Protein.Group")
+
+## Rtsne does not preserve rownames automatically, so add them manually
+df_tsne$Protein.Group <- rownames(mat_scaled)
+
+df_tsne <- df_tsne %>%
+  left_join(all_markers_final %>% dplyr::select(Protein.Group, markers) %>% 
+               distinct(), by = "Protein.Group") %>%
+  mutate(label = ifelse(is.na(markers), "unknown", as.character(markers)),
+         label = factor(label, levels = c(names(marker_palette), "unknown")))
+
+unknown_alpha <- 0.06
+unknown_size  <- 4
+known_alpha   <- 0.80
+known_size    <- 4
+
+ggplot(df_tsne, aes(x = tSNE1, y = tSNE2)) +
+  
+  # faint density/context layer for the full unlabelled proteome
+  stat_density_2d(
+    data = df_tsne %>% filter(label == "unknown"),
+    aes(x = tSNE1, y = tSNE2),
+    geom = "polygon",
+    fill = "grey70",
+    colour = NA,
+    alpha = 0.04,
+    bins = 8) +
+  
+  #unknown/background proteins
+  geom_point(
+    data = df_tsne %>% filter(label == "unknown"),
+    aes(colour = label),
+    alpha = unknown_alpha,
+    size = unknown_size) +
+  
+  #known marker proteins
+  geom_point(
+    data = df_tsne %>% filter(label != "unknown"),
+    aes(fill = label),
+    shape = 21,
+    colour = "grey20",
+    stroke = 0.18,
+    alpha = known_alpha,
+    size = known_size) +
+  
+  scale_colour_manual(values = plot_palette, drop = FALSE) +
+  scale_fill_manual(values = plot_palette, drop = FALSE) +
+  
+  theme_classic(base_size = 10, base_family = "Helvetica") +
+  labs(title = "t-SNE of protein fractionation profiles",
+    subtitle = "Sum-normalised and z-scaled",
+    x = "t-SNE 1",
+    y = "t-SNE 2",
+    colour = "compartment",
+    fill = "compartment") +
+  theme(legend.position = "right",
+    plot.title = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+```
+
+
+## Figure 2D: Within-group subject correlations
+
+- Each subject has 7271 protein fractionation profiles (log-scaled, MAI imputed). 
+- Pearson correlations are computed separately for CON, RES,and AD-DEM using pairwise complete observations.
+- The heatmap diagonal represents self-self correlation
+- the violin plot shows the distribution of pairwise correlation by group (one value per unique pair, excludes the diagnoal)
+
+Heatmaps include self-correlations; violin summaries retain one value per
+unique pair and exclude self-correlations. The source plotting limits are
+preserved. The reported 0.952–0.985 range has not been recomputed here.
+
+
+```{r correlation-heatmaps}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# ------------------------------------------------------------
+# 1) Prepare data
+# ------------------------------------------------------------
+corr_input <- prop %>%
+  mutate(
+    Fraction = as.character(Fraction),
+    feature_fraction = paste0(feature_id, "_F", Fraction)) %>%
+  dplyr::select(Group, Subject, feature_fraction, log2Quant)
+
+# ------------------------------------------------------------
+# 2) Function to make subject-subject correlation heatmap
+# ------------------------------------------------------------
+make_corr_heatmap <- function(df, group_name, show_legend = TRUE) {
+  
+  wide <- df %>%
+    filter(Group == group_name) %>%
+    dplyr::select(Subject, feature_fraction, log2Quant) %>%
+    pivot_wider(
+      names_from = Subject, values_from = log2Quant)
+  
+  mat <- wide %>%
+    dplyr::select(-feature_fraction) %>% as.matrix()
+  
+  rownames(mat) <- wide$feature_fraction
+  
+  cor_mat <- cor(mat, use = "pairwise.complete.obs", method = "pearson")
+  
+  cor_df <- as.data.frame(cor_mat) %>%
+    rownames_to_column("Subject1") %>%
+    pivot_longer(cols = -Subject1, names_to = "Subject2", values_to = "correlation")
+  
+  p <- ggplot(cor_df, aes(x = Subject1, y = Subject2, fill = correlation)) +
+    geom_tile() +
+    scale_fill_viridis_c(
+      option = "mako", direction = -1,
+      limits = c(0.95, 1),
+      name = "Pearson's r") +
+    labs(title = "", subtitle = group_name,
+      x = NULL, y = NULL) +
+    theme_classic(base_family = "Helvetica") +
+    theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 12),
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank())
+  
+  # toggle legend
+  if (!show_legend) {
+    p <- p + theme(legend.position = "none")
+  }
+  
+  return(p)
+}
+
+p_con <- make_corr_heatmap(corr_input, "CON", show_legend = FALSE)
+p_ad  <- make_corr_heatmap(corr_input, "AD-DEM", show_legend = FALSE)
+p_res <- make_corr_heatmap(corr_input, "RES", show_legend = TRUE)
+
+# ------------------------------------------------------------
+# Extract pairwise correlations per group
+# ------------------------------------------------------------
+get_pairwise_corrs <- function(df, group_name) {
+  
+  wide <- df %>%
+    filter(Group == group_name) %>%
+    dplyr::select(Subject, feature_fraction, log2Quant) %>%
+    pivot_wider(
+      names_from = Subject,
+      values_from = log2Quant)
+  
+  mat <- wide %>%
+    dplyr::select(-feature_fraction) %>% as.matrix()
+  
+  rownames(mat) <- wide$feature_fraction
+  
+  cor_mat <- cor(mat, use = "pairwise.complete.obs", method = "pearson")
+  
+  as.data.frame(cor_mat) %>%
+    rownames_to_column("Subject1") %>%
+    pivot_longer(
+      cols = -Subject1,
+      names_to = "Subject2",
+      values_to = "correlation") %>%
+    filter(Subject1 < Subject2) %>%   #upper triangle only
+    mutate(Group = group_name)
+}
+
+corr_dist <- bind_rows(
+  get_pairwise_corrs(corr_input, "CON"),
+  get_pairwise_corrs(corr_input, "RES"),
+  get_pairwise_corrs(corr_input, "AD-DEM"))
+
+# ------------------------------------------------------------
+# Summary stats if you want to report them
+# ------------------------------------------------------------
+corr_dist %>%
+  group_by(Group) %>%
+  summarise(min = min(correlation), max = max(correlation),
+    median_r = median(correlation, na.rm = TRUE),
+    q1 = quantile(correlation, 0.25, na.rm = TRUE),
+    q3 = quantile(correlation, 0.75, na.rm = TRUE), .groups = "drop")
+
+group_palette <- c("CON" = "royalblue1", "RES" = "yellowgreen", "AD-DEM" = "indianred2")
+
+corr_dist_plot <- ggplot(corr_dist, aes(x = Group, y = correlation, fill = Group)) +
+  geom_violin(trim = TRUE, width = 0.85, alpha = 0.8, colour = NA) +
+  geom_boxplot(width = 0.14, outlier.shape = NA, fill = "white", colour = "grey25", alpha = 0.5) +
+  stat_summary(fun = median, geom = "point",
+    size = 2,
+    colour = "black") +
+  scale_fill_manual(values = group_palette) +
+  scale_y_continuous(limits = c(0.84, 1)) +
+  labs(title = "Pairwise subject profile correlation", subtitle = "Median and IQR",
+    x = NULL, y = "Pairwise Pearson's r") +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 12))
+
+corr_dist_plot | p_ad | p_con | p_res
+```
