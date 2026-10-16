@@ -1,0 +1,644 @@
+---
+title: "Figure 3: Longitudinal resilience and protein fractionation"
+output: html_document
+---
+
+## Purpose
+
+ROSMAP longitudinal cognition model, subject-specific random-slope resilience scores and resilience-by-fraction models for Figure 3F–H.
+
+## Access and execution
+
+This code is for inspection. Restricted participant-level inputs and intermediate objects are not included. Access to the restricted  ROSMAP clinical and neuropathological data is subject to the applicable data-use agreements, and can be requested through https://www.radc.rush.edu/ and https://www.synapse.org/
+
+## Inputs and dependencies
+
+- `dataset_longitudinal.xlsx`: restricted longitudinal cognition (`projid`, `fu_year`, `cogn_global`, `age_at_visit`).
+- `dataset_cross_sectional.xlsx`: restricted `projid`, `gpath`, `msex`, `educ`.
+- `demogs.xlsx`: restricted `projid`–`Subject` mapping.
+
+```{r display-settings, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+## Read and join restricted cognition data
+
+```{r read-cognition}
+library(dplyr)
+library(readxl)
+library(readr)
+
+#extract longitudinal data for resilience modelling
+#read in longitudinal, create baseline measure columns
+
+# ------------------------------------------------------------
+# read in longitudinal, create baseline measure columns
+# ------------------------------------------------------------
+
+longitud <- readxl::read_xlsx("dataset_longitudinal.xlsx") %>% 
+  group_by(projid) %>%
+  mutate(baseline_cog = cogn_global[fu_year == 0][1], #record baseline cog
+         baseline_age = age_at_visit[fu_year == 0][1]) %>% ungroup() %>% 
+  #filter(projid %in% long_assays$projid) %>%
+ dplyr::select(projid, fu_year, cogn_global, baseline_cog, baseline_age) %>%
+  filter(!is.na(cogn_global), !is.na(fu_year)) %>% distinct()
+
+# ------------------------------------------------------------
+# read in crossec, extract demographic covars for model
+# ------------------------------------------------------------
+
+crossec <- readxl::read_xlsx("dataset_cross_sectional.xlsx")
+
+resilience_assay <- longitud %>%
+  left_join(crossec, by = "projid") %>%
+  filter(!is.na(baseline_cog), !is.na(gpath), !is.na(msex)) #!is.na(Subject)
+
+length(unique(resilience_assay$projid)) # 1972/3984 subjects have cog at baseline, sex, and gpath
+
+# ------------------------------------------------------------
+#demogs for projid - subject mapping
+# ------------------------------------------------------------
+demogs <- read_excel("demogs.xlsx")
+```
+
+
+## Fit the final full-cohort longitudinal model
+
+Inclusion requires at >=3 follow-up (fu) visits and obs for baseline cognition/age, post-mortem pathology score, sex
+
+```{r fit-longitudinal-model}
+library(data.table)
+library(lme4)
+
+# ------------------------------------------------------------
+# Convert to data.table
+# ------------------------------------------------------------
+cog_dt <- as.data.table(resilience_assay)
+
+# ------------------------------------------------------------
+# Keep one row per projid-visit
+# long_assays contains repeated protein/fraction rows
+# ------------------------------------------------------------
+cog_dt <- unique(
+  cog_dt[, .(
+    projid,
+    fu_year,
+    cogn_global,
+    baseline_cog,
+    baseline_age,
+    gpath,
+    msex)])
+
+# ------------------------------------------------------------
+# Complete cases
+# Do NOT require Subject to be present
+# ------------------------------------------------------------
+cog_dt <- cog_dt[
+  !is.na(projid) &
+  !is.na(fu_year) &
+  !is.na(cogn_global) &
+  !is.na(baseline_cog) &
+  !is.na(baseline_age) &
+  !is.na(gpath) &
+  !is.na(msex)]
+
+# ------------------------------------------------------------
+# Check number of observations per projid
+# ------------------------------------------------------------
+visit_counts <- cog_dt[, .N, by = projid]
+visit_counts[order(N)]
+
+# identify subjects with fewer than 3 follow-up observations
+visit_counts[N < 3]
+
+valid_projids <- visit_counts[N >= 3, projid]
+
+#filter cog_dt
+cog_dt <- cog_dt[projid %in% valid_projids] #1768/1972
+
+# ------------------------------------------------------------
+# Factor variables
+# ------------------------------------------------------------
+cog_dt[, projid := factor(projid)]
+cog_dt[, msex := factor(msex)]
+
+# ------------------------------------------------------------
+# Scale / centre continuous variables
+# ------------------------------------------------------------
+cog_dt[, fu_year_c := fu_year]
+
+cog_dt[, baseline_cog_c := as.numeric(scale(baseline_cog))]
+cog_dt[, baseline_age_c := as.numeric(scale(baseline_age))]
+cog_dt[, gpath_c        := as.numeric(scale(gpath))]
+
+# ------------------------------------------------------------
+# Fit resilience model
+# ------------------------------------------------------------
+
+library(lmerTest)
+m_res <- lmer(cogn_global ~ #fixed effects
+                fu_year_c + baseline_cog_c + baseline_age_c + msex + gpath_c +
+    
+    # covariate effects on rate of cognitive change (interaction between effect and longitudinal cognition)
+    fu_year_c:baseline_cog_c +
+    fu_year_c:baseline_age_c +
+    fu_year_c:msex +
+    fu_year_c:gpath_c +
+    
+    # individual deviation from expected intercept and slope
+    (1 + fu_year_c | projid),
+  
+  data = cog_dt,
+  REML = TRUE,
+  control = lmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 2e5)))
+
+summary(m_res)
+VarCorr(m_res)
+
+# ------------------------------------------------------------
+# Extract projid-specific residual decline slopes from the resilience model
+# ------------------------------------------------------------
+
+ranef_dt <- as.data.table(ranef(m_res)$projid, keep.rownames = "projid")
+
+#random slope = deviation from expected cognitive decline
+resilience_scores_all <- ranef_dt[ , .(projid, resilience_slope = fu_year_c)]
+
+#population-average time slope
+fixed_time_slope <- fixef(m_res)["fu_year_c"]
+
+# total slope:
+# population-average slope + individual deviation
+resilience_scores_all[, total_estimated_slope := fixed_time_slope + resilience_slope]
+
+resilience_scores_all[, projid := as.character(projid)]
+
+# ------------------------------------------------------------
+# Map the full-cohort resilience scores onto the 75 in the proteomics subjects
+# ------------------------------------------------------------
+
+# One row per proteomics Subject/projid
+subject_map <- demogs %>% dplyr::select(projid, Subject) %>% unique() %>% as.data.table()
+
+# Extract resilience scores for proteomics subjects only
+resilience_scores <- merge(
+  subject_map,
+  resilience_scores_all,
+  by = "projid",
+  all.x = TRUE)
+
+# Order by resilience
+setorder(resilience_scores, -resilience_slope)
+
+# ------------------------------------------------------------
+# checks
+# ------------------------------------------------------------
+
+# Full ROSMAP cohort
+hist(
+  resilience_scores_all$resilience_slope,
+  breaks = 1000,
+  main = "All ROSMAP participants",
+  xlab = "Resilience slope")
+summary(resilience_scores_all$resilience_slope)
+
+# Proteomics cohort only
+hist(resilience_scores$resilience_slope,
+  breaks = 75,
+  main = "Proteomics cohort",
+  xlab = "Resilience slope")
+summary(resilience_scores$resilience_slope)
+
+# Check all 75 proteomics participants received a score
+nrow(resilience_scores)
+sum(is.na(resilience_scores$resilience_slope)) #H7 has only 2 visits so is NA
+resilience_scores_proteomics <- resilience_scores %>% dplyr::select(-projid)
+
+#write_csv(resilience_scores_proteomics, "resilience_scores.csv")
+```
+
+
+## Figure 3F–G: Cognitive trajectories and resilience
+
+
+```{r trajectory-plots}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(ggrepel)
+library(patchwork)
+
+# ============================================================
+# 1) Prepare resilience data
+# ============================================================
+
+res_dt_plot <- as.data.table(copy(resilience_scores))
+res_dt_plot[, projid := as.character(projid)]
+res_dt_plot[, Subject := as.character(Subject)]
+res_dt_plot <- res_dt_plot[!is.na(resilience_slope)]  #74 subjects
+
+# ============================================================
+# 2) prepare longitudinal trajectory data
+# ============================================================
+
+plot_dt <- as.data.table(copy(cog_dt))
+plot_dt[, projid := as.character(projid)]
+plot_dt <- plot_dt[projid %in% res_dt_plot$projid]
+
+plot_dt[, fitted_subject := predict(m_res, newdata = plot_dt, re.form = NULL)]
+
+plot_dt <- merge(
+  plot_dt,
+  res_dt_plot[, .(projid, Subject, resilience_slope)],
+  by = "projid",
+  all.x = TRUE)
+
+setorder(plot_dt, projid, fu_year_c)
+
+# ============================================================
+# 3) Add pathology to resilience data
+# ============================================================
+
+projid_gpath <- unique(plot_dt[, .(projid, gpath_c)])
+
+res_dt_plot <- merge(
+  res_dt_plot,
+  projid_gpath,
+  by = "projid",
+  all.x = TRUE)
+
+# ============================================================
+# 4) pathology-predicted decline for visualisation
+# ============================================================
+
+beta <- fixef(m_res) #these are the fixed effect predictions
+
+res_dt_plot[, expected_slope := beta["fu_year_c"] + beta["fu_year_c:gpath_c"] * gpath_c]
+
+res_dt_plot[, plotted_slope := expected_slope + resilience_slope]
+
+gpath_grid <- data.table(gpath_c = seq(min(res_dt_plot$gpath_c, na.rm = TRUE),
+                                       max(res_dt_plot$gpath_c, na.rm = TRUE), length.out = 100))
+
+gpath_grid[, expected_slope := beta["fu_year_c"] + beta["fu_year_c:gpath_c"] * gpath_c]
+
+# ============================================================
+# 5) Label example subjects
+# ============================================================
+
+label_df <- res_dt_plot %>%
+  as_tibble() %>%
+  filter(
+    gpath_c > quantile(gpath_c, 0.66, na.rm = TRUE),
+    abs(resilience_slope) > quantile(abs(resilience_slope), 0.85, na.rm = TRUE))
+
+# ============================================================
+# 6) Cognitive trajectories
+# ============================================================
+
+p_traj <- ggplot() +
+  geom_line(
+    data = plot_dt,
+    aes(x = fu_year_c, y = cogn_global, group = Subject),
+    colour = "grey80", linewidth = 0.3, alpha = 0.8) +
+  geom_line(
+    data = plot_dt,
+    aes(x = fu_year_c, y = fitted_subject, group = Subject, colour = resilience_slope),
+    linewidth = 0.75, alpha = 0.95) +
+  scale_colour_viridis_c(option = "magma", name = "Residual slope\n(resilience)") +
+  labs(
+    title = "Model-estimated cognitive trajectories",
+    subtitle = "Observed (grey) and fitted trajectories",
+    x = "Follow-up year",
+    y = "Global cognition") +
+  theme_classic(base_size = 10, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.position = "none")
+
+# ============================================================
+# 7) Resilience vs pathology
+# ============================================================
+
+p_gpath_resilience <- ggplot(res_dt_plot, aes(x = gpath_c, y = plotted_slope)) +
+  geom_segment(
+    aes(xend = gpath_c, y = expected_slope, yend = plotted_slope),
+    colour = "grey70", linewidth = 0.35, alpha = 0.65) +
+  geom_line(
+    data = gpath_grid,
+    aes(x = gpath_c, y = expected_slope),
+    inherit.aes = FALSE,
+    colour = "black", linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey65") +
+  geom_point(aes(colour = resilience_slope), size = 2.8, alpha = 0.9) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = Subject),
+    size = 3, max.overlaps = Inf,
+    box.padding = 0.25, point.padding = 0.25, segment.size = 0.2) +
+  scale_colour_viridis_c(option = "magma", name = "Residual slope\n(resilience)") +
+  labs(
+    title = "Resilience as deviation from expected decline",
+    subtitle = "Lines show subject-specific deviation from pathology-predicted decline",
+    x = "Global pathology burden (scaled)",
+    y = "Cognitive decline rate\n(more negative = faster decline)") +
+  theme_classic(base_size = 10, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+```
+
+
+## Join the newly derived resilience scores to protein inputs
+
+
+```{r load-protein-context}
+#prop_long, and model_gene_list objects obtained from Modelling.Rmd are required for downstream steps
+prop_long <- prop_long %>% left_join(resilience_scores_proteomics, by = "Subject")
+```
+
+
+## Figure 3H: Resilience-by-fraction models
+
+
+```{r fit-resilience-interactions}
+library(lme4)
+library(dplyr)
+library(performance)
+library(tibble)
+library(readr)
+
+fit_fraction_resilience_models <- function(
+    gene_list,
+    dataframe,
+    assay_to_use = c("imputed", "unimputed"),
+    dataset_label = NULL,
+    feature_var = "Genes",
+    response_var = "log2_value",
+    resilience_var = "resilience_slope",
+    fraction_var = "Fraction",
+    subject_var = "Subject",
+    pmi_var = "pmi",
+    age_var = "age_death", #added age at death as a new variable (suggested by David Bennett)
+    fraction_levels = as.character(1:7),
+    scale_continuous = TRUE,
+    min_rows = 10,
+    fdr_method = "BH") {
+  
+  assay_to_use <- match.arg(assay_to_use)
+  if (is.null(dataset_label)) dataset_label <- assay_to_use
+  
+  df0 <- dataframe %>%
+    filter(assay_type == assay_to_use) %>%
+    mutate(
+      !!fraction_var := factor(.data[[fraction_var]], levels = fraction_levels),
+      !!subject_var := factor(.data[[subject_var]]))
+  
+  if (scale_continuous) {
+    
+    df0[[paste0(resilience_var, "_z")]] <- as.numeric(scale(df0[[resilience_var]]))
+    df0[[paste0(pmi_var, "_z")]] <- as.numeric(scale(df0[[pmi_var]]))
+    df0[[paste0(age_var, "_z")]] <- as.numeric(scale(df0[[age_var]]))
+    
+    resilience_term <- paste0(resilience_var, "_z")
+    pmi_term <- paste0(pmi_var, "_z")
+    age_term <- paste0(age_var, "_z") } 
+  
+  else {
+    resilience_term <- resilience_var
+    pmi_term <- pmi_var
+    age_term <- age_var }
+  
+  reduced_formula <- as.formula(
+    paste(response_var, "~", paste(
+        c(fraction_var, resilience_term, pmi_term, age_term,
+          paste0(pmi_term, ":", fraction_var),
+          paste0(age_term, ":", fraction_var)),
+        collapse = " + " ),
+      "+ (1 |", subject_var, ")"))
+  
+  full_formula <- as.formula(
+    paste(response_var, "~",
+      paste(
+        c(fraction_var, resilience_term, pmi_term, age_term,
+          paste0(pmi_term, ":", fraction_var),
+          paste0(age_term, ":", fraction_var),
+          paste0(resilience_term, ":", fraction_var)),
+        collapse = " + " ),
+      "+ (1 |", subject_var, ")"))
+  
+  results <- vector("list", length(gene_list))
+  names(results) <- gene_list
+  
+  for (gene in gene_list) {
+    
+    dat_g <- df0 %>%
+      filter(.data[[feature_var]] == gene) %>%
+      filter(
+        !is.na(.data[[response_var]]),
+        !is.na(.data[[fraction_var]]),
+        !is.na(.data[[subject_var]]),
+        !is.na(.data[[resilience_term]]),
+        !is.na(.data[[pmi_term]]))
+    
+    if (nrow(dat_g) < min_rows || nlevels(dat_g[[fraction_var]]) < 2) next
+    
+    model_noint <- try(
+      lmer(
+        reduced_formula,
+        data = dat_g,
+        REML = FALSE,
+        control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+      silent = TRUE)
+    
+    model_full <- try(
+      lmer(full_formula, data = dat_g, REML = FALSE,
+        control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+      silent = TRUE)
+    
+    if (inherits(model_noint, "try-error") || inherits(model_full, "try-error")) next
+    if (any(is.na(fixef(model_full)))) next
+    
+    an <- try(anova(model_noint, model_full), silent = TRUE)
+    if (inherits(an, "try-error")) next
+    
+    pval <- an$`Pr(>Chisq)`[2]
+    chisq <- an$Chisq[2]
+    if (is.na(pval)) next
+    
+    r2_noint <- suppressWarnings(r2_nakagawa(model_noint)$R2_marginal)
+    r2_full  <- suppressWarnings(r2_nakagawa(model_full)$R2_marginal)
+    
+    results[[gene]] <- tibble(
+      Genes = gene,
+      dataset = dataset_label,
+      predictor = resilience_var,
+      n_obs = nrow(dat_g),
+      n_subjects = n_distinct(dat_g[[subject_var]]),
+      chi_sq = chisq,
+      p_value = pval,
+      delta_margin_r2 = r2_full - r2_noint,
+      singular_reduced = isSingular(model_noint, tol = 1e-4),
+      singular_full = isSingular(model_full, tol = 1e-4) )
+  }
+  
+  out <- bind_rows(results) %>%
+    mutate(padj = p.adjust(p_value, method = fdr_method)) %>%
+    arrange(padj, p_value)
+  
+  list(
+    full_list_mixmod = out,
+    significant_mixmod = out %>% filter(padj < 0.05))
+}
+
+res_resilience <- fit_fraction_resilience_models(
+  gene_list = model_gene_list,
+  dataframe = prop_long,
+  assay_to_use = "unimputed",
+  dataset_label = "unimputed",
+  resilience_var = "resilience_slope",
+  pmi_var = "pmi",
+  age_var = "age_death",
+  scale_continuous = TRUE)
+
+res_resilience_imp <- fit_fraction_resilience_models(
+  gene_list = model_gene_list,
+  dataframe = prop_long,
+  assay_to_use = "imputed",
+  dataset_label = "imputed",
+  resilience_var = "resilience_slope",
+  pmi_var = "pmi",
+  age_var = "age_death",
+  scale_continuous = TRUE)
+
+
+res_resilience$significant_mixmod %>% arrange(desc(delta_margin_r2)) #54 from unimputed analysis
+res_resilience_imp$significant_mixmod %>% arrange(desc(delta_margin_r2)) #29 from imputed
+
+all_genes <- union(res_resilience$significant_mixmod$Genes, res_resilience_imp$significant_mixmod$Genes) #59 across both models
+
+intersection <- res_resilience$significant_mixmod %>% filter(Genes %in% res_resilience_imp$significant_mixmod$Genes) #24/59 total (24 robust to imputation strategy)
+range(intersection$delta_margin_r2) #effect size (marginal R2) range: 0.003-0.084
+
+#14 of the intersection are present in the 217 robust AD/CON/RES categorical model results
+
+#write_csv(res_resilience$full_list_mixmod, "resilience_slope_final.csv")
+#write_csv(res_resilience_imp$full_list_mixmod, "imp_resilience_slope_final.csv")
+```
+
+
+## Figure 3H: Plot stable resilience results
+
+```{r resilience-volcano}
+library(ggrepel)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tibble)
+
+res_resil <- res_resilience$full_list_mixmod #all modelled (for full volcano) = 4794
+res_resil_signif <- res_resil %>% filter(padj <= 0.05) #all significant from the unimputed analysis (for labelling) = 54
+
+# results table
+df <- as_tibble(res_resil) %>% mutate(log10pval = -log10(p_value))
+
+# genes significant in both the imputed and unimputed analyses
+stable_genes <- intersection %>% pull(Genes) %>% unique() # 24/54 are robust to imputation strategy
+
+# add a logical 'robust' indicator to df
+df <- df %>% mutate(is_stable = Genes %in% stable_genes)
+
+# all significant results to label
+top_labels <- df %>% filter(padj < 0.05)
+
+## optimising to prevent label overlap...
+#OR just Label only the 24 stable significant genes
+top_labels <- df %>% filter(padj < 0.05, is_stable)
+#OR the 24 stable and non-stable when R2 > 2% 
+top_labels <- df %>% filter(padj < 0.05, is_stable | (!is_stable & delta_margin_r2 > 0.02)) #
+
+plot_resilience <- ggplot(
+  df, aes(
+    x = delta_margin_r2,
+    y = log10pval)) +
+
+  #non-significant background
+  geom_point(
+    data = filter(df, padj >= 0.05),
+    colour = "grey85",
+    size = 1.5,
+    alpha = 0.5) +
+
+  #significant, non-robust results: open circles
+  geom_point(
+  data = filter(df, padj < 0.05, !is_stable),
+  aes(colour = padj),
+  shape = 1,
+  stroke = 0.9,
+  size = 2) +
+
+#significant AND robust results: filled circles
+  geom_point(
+  data = filter(df, padj < 0.05, is_stable),
+  aes(colour = padj),
+  shape = 16,
+  size = 2.25,
+  alpha = 0.9) +
+
+  # gene labels
+  geom_text_repel(
+    data = top_labels,
+    aes(
+      label = Genes,
+      colour = padj),
+    size = 2.5,
+    fontface = "bold",
+    max.overlaps = 30,
+    max.iter = 20000,
+    force = 2,
+    force_pull = 0.8,
+    box.padding = 0.5,
+    point.padding = 0.15,
+    min.segment.length = 0) +
+
+  scale_colour_gradient(
+    low = "#006D77",
+    high = "#A7C957",
+    trans = "reverse",
+    name = "FDR (padj)" ) +
+
+  theme_classic(
+    base_size = 10,
+    base_family = "Helvetica") +
+
+  labs(
+    title = "Resilience × Fraction interaction",
+    subtitle = "Top significant proteins labelled",
+    x = expression(Delta * " marginal R"^2),
+    y = expression(-log[10](p-value))) +
+
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+
+plot_resilience
+```
+
