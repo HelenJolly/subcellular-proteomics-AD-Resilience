@@ -8,13 +8,14 @@ This repository contains R Markdown workflow for a study of subcellular proteomi
 | --- | --- | --- |
 | `protein_matrix_QC.Rmd` | Protein-level filtering, log2 transformation, MAI imputation, SummarizedExperiment (SE) storage and run-level PCA | Processed protein matrix, SE object, and Supplementary Figure S1 |
 | `Figure2_subcell_profiles.Rmd` | Protein fractionation profile clustering, GO:CC enrichment, curated marker profile visualisation, t-SNE and within-group subject correlations | Figure 2A, 2C, 2D and Supplementary Figure S2 |
+| `Figure3_Modelling_categorical.Rmd` | Relative predictor importance, disease-by-fraction mixed models, comparison of imputed and unimputed results, protein profiles and GO:CC enrichment | Figure 3A–E |
+| `Figure3_Modelling_Resilience.Rmd` | Longitudinal cognition modelling, derivation of resilience scores and resilience-by-fraction mixed models | Figure 3F–H |
 
 ## Data availability
 
 This repository contains analysis code, not restricted participant-level data.
 The code can be inspected without the input data; some elements of execution require authorised access to the restricted metadata:
-ROSMAP clinical and neuropathological data access is subject to the applicable
-data-use agreements, through [Rush Alzheimer's Disease Center](https://www.radc.rush.edu) and [Synapse](https://www.synapse.org).
+ROSMAP clinical and neuropathological data access is subject to the applicable data-use agreements, through [Rush Alzheimer's Disease Center](https://www.radc.rush.edu) and [Synapse](https://www.synapse.org).
 
 ## Protein matrix QC workflow
 
@@ -47,6 +48,33 @@ Configure `data_dir` to point to the directory containing:
 - `data/sample_category.csv`: subject-to-disease-group mapping, with `Subject` and `Group` columns (CON`,`RES`,`AD-DEM`.
 
 Automatic code execution during knitting is disabled (`eval = FALSE`). Individual chunks can be run locally once the required inputs and packages are available.
+
+## Disease and resilience modelling workflows
+
+### Disease-associated protein fractionation — Figure 3A–E
+
+`Figure3_Modelling_categorical.Rmd` prepares protein profiles from the imputed and unimputed assays and identifies those eligible for localisation modelling. Relative predictor importance is compared using drop-one-out changes in marginal R2. Disease-associated (CON/RES/AD-DEM) differences in fractionation profiles are identified using mixed models with disease-group x fraction interactions.
+
+Results are compared between imputed and unimputed analyses to identify robust associations. Example protein profiles and GO Cellular Component enrichment analysis is also included.
+
+Required inputs are:
+
+- `MAI_prot_model_new.rds` 
+- `demogs.xlsx` 
+
+
+### Resilience-associated protein fractionation — Figure 3F–H
+
+`Figure3_Modelling_Resilience.Rmd` fits a longitudinal mixed model of cognition using the full available ROSMAP cohort, retaining individuals with at least three lognitudinal cognitive observations and the required covariates.
+These resilience scores are linked to the proteomics cohort and used in the localisation mixed model to identify a resilience x fraction interaction effect. Results from imputed and unimputed protein intensities are compared to identify robust associations. The script also includes cognitive trajectory and resilience visualisations.
+
+Additional required inputs are:
+
+- `dataset_longitudinal.xlsx`: restricted longitudinal cognition data.
+- `dataset_cross_sectional.xlsx`: restricted pathology and demographic covariates.
+- `demogs.xlsx`
+
+The protein preparation and eligibility sections of `Figure3_Modelling_categorical.Rmd` need to be run before the resilience workflow. Intermediate data and model outputs are not included in this repository. 
 
 ## Software
 
