@@ -1,0 +1,983 @@
+---
+title: "Figure 3: Disease-associated protein fractionation models"
+output: html_document
+---
+
+## Purpose
+
+Protein-level input preparation, model eligibility, variance decomposition, disease-by-fraction interaction models, robust-hit selection, example profiles and GO:CC enrichment for Figure 3A–E. The code for Figure 3F–H can be found in in `Resilience_modelling_final.Rmd`.
+
+## Access and execution
+
+This code is for inspection. Restricted participant-level inputs and intermediate objects are not included. Access to the restricted  ROSMAP clinical and neuropathological data is subject to the applicable data-use agreements, and can be requested through https://www.radc.rush.edu/ and https://www.synapse.org/
+
+## Inputs
+
+- `MAI_prot_model_new.rds`: Protein-level data - QC SummarizedExperiment with `log2Quant` and `MAI_imputed`.
+- `demogs.xlsx`: Subject-level data - restricted subject covariates (`Subject`, `pmi`, `msex`, `age_death`, `gpath`, `Group`).
+
+```{r display-settings, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Prepare imputed and unimputed protein inputs
+
+```{r prepare-protein-inputs}
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(readxl)
+library(readr)
+library(stringr)
+
+# ------------------------------------------------------------
+# 1. Load SE containing both assays
+# ------------------------------------------------------------
+se_log2 <- readRDS("MAI_prot_model_new.rds")
+assayNames(se_log2)
+#"log2Quant", "MAI_imputed" (unimputed and imputed log-scaled intensity matrices)
+
+# ------------------------------------------------------------
+# 2. Pull row/column metadata
+# ------------------------------------------------------------
+row_meta <- rowData(se_log2) %>% as.data.frame() %>% rownames_to_column("feature_id")
+col_meta <- colData(se_log2) %>% as.data.frame() %>% dplyr::select(Plate, Well, Subject, Fraction) %>% rownames_to_column("RunID")
+
+# ------------------------------------------------------------
+# 3. extract assay and pivot to long format
+# ------------------------------------------------------------
+extract_assay_long <- function(se, assay_name, assay_type_label) {
+  assay(se, assay_name) %>%
+    as.data.frame() %>% rownames_to_column("feature_id") %>%
+    pivot_longer(cols = -feature_id, names_to = "RunID", values_to = "log2_value") %>%
+    mutate(assay_name = assay_name,
+           assay_type = assay_type_label)
+}
+
+# ------------------------------------------------------------
+# 4. concatenate imputed and unimputed together for easy indexing in model function
+# ------------------------------------------------------------
+long_assays <- bind_rows(
+  extract_assay_long(se_log2, "log2Quant", "unimputed"),
+  extract_assay_long(se_log2, "MAI_imputed", "imputed")) %>%
+  #obtain the raw intensity value from the log2 scaled values
+  mutate(value = 2^log2_value) %>%
+  #join with the row and column metadata
+  left_join(row_meta, by = "feature_id") %>%
+  left_join(col_meta, by = "RunID") 
+
+# ------------------------------------------------------------
+# 5. # Join with demographic data and markers
+# ------------------------------------------------------------
+demogs <- read_excel(input_file("demogs.xlsx")) %>% 
+  dplyr::select(Subject, pmi, msex, age_death, gpath, Group)
+
+long_assays <- long_assays %>% left_join(demogs, by = "Subject")
+
+# ------------------------------------------------------------
+# 6. #Flag and fix ambiguous gene names across both assays (multi-protein Genes)
+# ------------------------------------------------------------
+long_assays <- long_assays %>%
+  group_by(Genes) %>%
+  mutate(multi_pg_flag = n_distinct(Protein.Group) > 1) %>%
+  ungroup() %>%
+  mutate(Genes = if_else(multi_pg_flag,
+      paste0(Genes, "_", Protein.Group), Genes))
+
+long_assays %>% filter(multi_pg_flag == TRUE) %>% dplyr::select(Genes, Protein.Group) %>% distinct() #check
+long_assays %>% dplyr::select(Genes, Protein.Group) %>% distinct()
+
+# ------------------------------------------------------------
+# 7. #sum-normalise both assays separately
+# ------------------------------------------------------------
+prop_long <- long_assays %>%
+  mutate(Fraction = factor(Fraction, levels = as.character(1:7)),
+         Group = factor(Group, levels = c("CON", "RES", "AD-DEM"))) %>%
+  group_by(assay_type, Subject, feature_id) %>%
+  mutate(sum = sum(value, na.rm = TRUE),
+         prop = value / sum) %>% ungroup()
+```
+
+
+## Define the eligible protein set
+
+- Based on threshsolds: <70% missingness, total intensity >500 for every subject, and >= 4 observations per disease-group fraction.
+- Count: 4794 - to be used as background set for enrichment analysis
+
+```{r model-universe}
+# ------------------------------------------------------------
+# 7. #define model Gene universe (function): 
+# ------------------------------------------------------------
+filter_model_genes <- function(
+    df,
+    assay = "unimputed",
+    feature_var = "Genes",
+    group_var = "Group",
+    subject_var = "Subject",
+    fraction_var = "Fraction",
+    raw_var = "value",
+    quant_var = "log2_value",
+    groups_to_keep = c("CON", "RES", "AD-DEM"),
+    max_global_missing = 0.70,
+    min_subject_sum = 500,
+    min_nonmissing_per_cell = 5) {
+  
+  df0 <- df %>%
+    filter(assay_type == assay, .data[[group_var]] %in% groups_to_keep) %>%
+    mutate(
+      !!group_var := factor(.data[[group_var]], levels = groups_to_keep),
+      !!fraction_var := factor(.data[[fraction_var]], levels = as.character(1:7)))
+  
+  crit_a <- df0 %>%
+    group_by(.data[[feature_var]]) %>%
+    summarise(prop_missing = mean(is.na(.data[[quant_var]])), .groups = "drop") %>%
+    filter(prop_missing < max_global_missing)
+  
+  crit_b <- df0 %>%
+    group_by(.data[[feature_var]], .data[[subject_var]]) %>%
+    summarise(total_raw = sum(.data[[raw_var]], na.rm = TRUE), .groups = "drop") %>%
+    group_by(.data[[feature_var]]) %>%
+    summarise(pass_subject_sum = all(total_raw > min_subject_sum), .groups = "drop") %>%
+    filter(pass_subject_sum)
+  
+  crit_c <- df0 %>%
+    group_by(.data[[feature_var]], .data[[group_var]], .data[[fraction_var]]) %>%
+    summarise(n_nonmissing = sum(!is.na(.data[[quant_var]])), .groups = "drop") %>%
+    group_by(.data[[feature_var]]) %>%
+    summarise(
+      min_cell_n = min(n_nonmissing),
+      pass_cell_n = all(n_nonmissing >= min_nonmissing_per_cell),
+      .groups = "drop") %>%
+    filter(pass_cell_n)
+  
+  gene_table <- crit_a %>%
+    inner_join(crit_b, by = feature_var) %>%
+    inner_join(crit_c, by = feature_var) %>%
+    dplyr::select(all_of(feature_var), prop_missing, min_cell_n)
+  
+  list(gene_list = gene_table[[feature_var]],
+      gene_table = gene_table,
+      n_genes = nrow(gene_table))
+}
+
+#### FILTER #####
+gene_filter <- filter_model_genes(
+  df = prop_long,
+  assay = "unimputed",
+  feature_var = "Genes",
+  group_var = "Group",
+  subject_var = "Subject",
+  fraction_var = "Fraction",
+  raw_var = "value",
+  quant_var = "log2_value",
+  groups_to_keep = c("CON", "RES", "AD-DEM"),
+  max_global_missing = 0.70,
+  min_subject_sum = 500,
+  min_nonmissing_per_cell = 4)
+
+model_gene_list <- gene_filter$gene_list
+length(model_gene_list) #4794
+#write_csv(gene_filter$gene_table, output_file("backgroundset_4794.csv"))
+```
+
+
+## Figure 3A: Variance decomposition
+
+Compares the relative importance of predictors for each protein (quantifies decrease in marginal R2 when each predictor is removed from the full model). Negative differences are set to zero, and each decrease is expressed as a proportion of their sum.
+
+```{r variance-models}
+library(dplyr)
+library(tibble)
+library(lme4)
+library(performance)
+
+# ------------------------------------------------------------
+# 1) Prepare data
+# ------------------------------------------------------------
+varpart_input <- prop_long %>%
+  filter(assay_type == "imputed") %>%
+  dplyr::select(Genes, log2_value, Group, Fraction, age_death, msex, pmi, Subject) %>%
+  filter(Group %in% c("AD-DEM", "CON", "RES"), Genes %in% model_gene_list) %>%
+  mutate(Condition   = factor(Group),
+    Fraction    = factor(Fraction),
+    msex        = factor(msex),
+    Subject     = factor(Subject),
+    age_death_z = as.numeric(scale(age_death)),
+    pmi_z       = as.numeric(scale(pmi)))
+
+
+#Store results
+res_list <- vector("list", length(unique(varpart_input$Genes)))
+names(res_list) <- unique(varpart_input$Genes)
+
+# ------------------------------------------------------------
+# 2) Loop through genes
+# ------------------------------------------------------------
+for (g in unique(varpart_input$Genes)) {
+  
+  cat("Running:", g, "\n")
+  control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  
+  df_gene <- varpart_input %>% filter(Genes == g)
+  
+  # full model
+  full_mod <- lmer(
+    log2_value ~ Condition + Fraction + age_death_z + msex + pmi_z + (1 | Subject),
+    data = df_gene, REML = FALSE,
+    control = control)
+  
+  full_r2 <- r2_nakagawa(full_mod)$R2_marginal
+  
+  # reduced models
+  mod_condition <- lmer(
+    log2_value ~ Fraction + age_death_z + msex + pmi_z + (1 | Subject),
+    data = df_gene, REML = FALSE,
+    control = control)
+  
+  mod_fraction <- lmer(
+    log2_value ~ Condition + age_death_z + msex + pmi_z + (1 | Subject),
+    data = df_gene, REML = FALSE, control = control)
+  
+  mod_age <- lmer(
+    log2_value ~ Condition + Fraction + msex + pmi_z + (1 | Subject),
+    data = df_gene, REML = FALSE, control = control)
+  
+  mod_sex <- lmer(
+    log2_value ~ Condition + Fraction + age_death_z + pmi_z + (1 | Subject),
+    data = df_gene, REML = FALSE,  control = control)
+  
+  mod_pmi <- lmer(
+    log2_value ~ Condition + Fraction + age_death_z + msex + (1 | Subject),
+    data = df_gene, REML = FALSE, control = control)
+  
+  # reduced model R2
+  r2_condition <- r2_nakagawa(mod_condition)$R2_marginal
+  r2_fraction  <- r2_nakagawa(mod_fraction)$R2_marginal
+  r2_age       <- r2_nakagawa(mod_age)$R2_marginal
+  r2_sex       <- r2_nakagawa(mod_sex)$R2_marginal
+  r2_pmi       <- r2_nakagawa(mod_pmi)$R2_marginal
+  
+  #delta R2
+  out <- tibble(
+    Genes = g, term = c("Condition", "Fraction", "age_death", "msex", "pmi"),
+    delta_r2 = c(
+      full_r2 - r2_condition,
+      full_r2 - r2_fraction,
+      full_r2 - r2_age,
+      full_r2 - r2_sex,
+      full_r2 - r2_pmi)) %>%
+    mutate(delta_r2 = pmax(delta_r2, 0), pct = delta_r2 / sum(delta_r2) * 100)
+  
+  res_list[[g]] <- out
+}
+
+#bind together
+varpart_perc <- bind_rows(res_list)
+varpart_perc
+```
+
+
+## Figure 3A: Plot relative variance contributions
+
+```{r variance-plot}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ------------------------------------------------------------
+# 1) Transform variance
+# ------------------------------------------------------------
+varpart_perc <- varpart_perc %>% mutate(log_pct = log(1+pct), sqrt_pct = sqrt(pct))  #scaled var for visualisation
+
+# ------------------------------------------------------------
+# 2) Order terms
+# ------------------------------------------------------------
+term_order <- varpart_perc %>%
+  group_by(term) %>%
+  summarise(mean_pct = mean(pct, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_pct)) %>%
+  pull(term)
+
+varpart_perc$term <- factor(varpart_perc$term, levels = term_order)
+
+# ------------------------------------------------------------
+# 3) Top labels
+# ------------------------------------------------------------
+top10_proteins <- varpart_perc %>%
+  group_by(term) %>% filter(term == "Condition") %>%
+  slice_max(order_by = pct, n = 10, with_ties = FALSE)
+
+top10_labels <- top10_proteins %>%
+  group_by(term) %>%
+  arrange(desc(sqrt_pct), .by_group = TRUE) %>%
+  mutate(
+    ymax = max(sqrt_pct),
+    label_y = ymax + seq(1.2, by = -0.5, length.out = n())) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 4) Palette
+# ------------------------------------------------------------
+my_pal <- c(
+  age_death = "#66C2A5", msex  = "#FC8D62", Condition = "dodgerblue2", Fraction  = "plum2", pmi = "#8DA0CB")
+
+# ------------------------------------------------------------
+# 5) Plot
+# ------------------------------------------------------------
+fixed <- ggplot(varpart_perc, aes(x = term, y = sqrt_pct, fill = term)) +
+  
+  geom_violin(width = 0.8,  scale = "width", trim = TRUE, alpha = 0.85, colour = NA) +
+  
+  geom_boxplot( width = 0.1, outlier.shape = NA, colour = "grey20", alpha = 0.9) +
+  
+  geom_text(
+  data = top10_labels,
+  aes(y = label_y, label = Genes, colour = term),
+  size = 3,
+  fontface = "italic",
+  hjust = 0.5,
+  show.legend = FALSE) +
+  
+  scale_fill_manual(values = my_pal) +
+  scale_colour_manual(values = my_pal) +
+  
+  labs(x = NULL,  y = "√(variance explained %)") +
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+theme(
+  legend.position = "none",
+  plot.title = element_text(face = "bold", size = 10),
+  plot.subtitle = element_text(size = 10),
+  axis.title = element_text(size = 10),
+  axis.text = element_text(size = 10),
+  axis.text.x = element_text(size = 10),
+  legend.title = element_text(size = 10),
+  legend.text = element_text(size = 10))
+
+fixed
+```
+
+
+## Disease-by-fraction model function
+
+```{r disease-model-function}
+# ------------------------------------------------------------
+# 8. #write model function 
+# ------------------------------------------------------------
+library(lme4)
+library(dplyr)
+library(performance)
+library(tibble)
+
+#pass arguments to function
+fit_fraction_interaction_models <- function(
+    gene_list, dataframe,
+    assay_to_use = c("imputed", "unimputed"),
+    dataset_label = NULL,
+    feature_var = "Genes",
+    response_var = "log2_value",
+    group_var = "Group",
+    fraction_var = "Fraction",
+    subject_var = "Subject",
+    sex_var = "msex",
+    continuous_vars = c("age_death", "pmi"),
+    group_levels = c("CON", "RES", "AD-DEM"),
+    ref_group = "CON",
+    fraction_levels = as.character(1:7),
+    scale_continuous = TRUE,
+    include_covariate_fraction_interactions = TRUE,
+    min_rows = 10, fdr_method = "BH"
+) {
+  
+  assay_to_use <- match.arg(assay_to_use)
+  if (is.null(dataset_label)) dataset_label <- assay_to_use
+  
+  df0 <- dataframe %>%
+    filter(assay_type == assay_to_use, .data[[group_var]] %in% group_levels ) %>% #filter conditions
+    mutate(!!group_var := factor(.data[[group_var]], levels = group_levels), #set categ vars
+      !!group_var := relevel(.data[[group_var]], ref = ref_group),
+      !!fraction_var := factor(.data[[fraction_var]], levels = fraction_levels),
+      !!subject_var := factor(.data[[subject_var]]),
+      !!sex_var := factor(.data[[sex_var]]))
+  
+  if (scale_continuous) { #scale continuous variables, pmi and age_death
+    z_names <- paste0(continuous_vars, "_z")
+    for (i in seq_along(continuous_vars)) {
+      v <- continuous_vars[i]
+      vz <- z_names[i]
+      df0[[vz]] <- as.numeric(scale(df0[[v]]))
+    }
+    cont_terms <- z_names
+  } else {
+    cont_terms <- continuous_vars
+  }
+  
+  main_cov_terms <- c(cont_terms, sex_var)
+  
+  ## this tells the model to fit interaxtions with pmi, age_death and sex 
+  if (include_covariate_fraction_interactions) {
+    frac_cov_terms <- c(paste0(cont_terms, ":", fraction_var), paste0(sex_var, ":", fraction_var) )
+  } else {
+    frac_cov_terms <- character(0)
+  }
+  
+  ## define predictor terms for full and reduced model
+  reduced_terms <- c(group_var, fraction_var, main_cov_terms, frac_cov_terms)
+  full_terms    <- c(reduced_terms, paste0(group_var, ":", fraction_var))
+  
+  ## define both formulas (full and reduced)
+  reduced_formula <- as.formula(paste(response_var, "~", paste(reduced_terms, collapse = " + "), "+ (1 |", subject_var, ")"))
+  full_formula <- as.formula(paste(response_var, "~", paste(full_terms, collapse = " + "),  "+ (1 |", subject_var, ")"))
+  
+  #Store results in a list
+  results <- vector("list", length(gene_list))
+  names(results) <- gene_list
+  
+  for (gene in gene_list) { #iterate through gene universe
+    dat_g <- df0 %>%
+      filter(.data[[feature_var]] == gene) %>%
+      filter( #ensure categorical variables are present for this gene
+        !is.na(.data[[response_var]]),
+        !is.na(.data[[group_var]]),
+        !is.na(.data[[fraction_var]]),
+        !is.na(.data[[subject_var]]),
+        !is.na(.data[[sex_var]]))
+    
+    for (v in cont_terms) { #ensure continuous variables are present for this gene
+      dat_g <- dat_g %>% filter(!is.na(.data[[v]]))
+    }
+    
+    ##minumum levels required (skip if missing)
+    if (nrow(dat_g) < min_rows ||
+        nlevels(dat_g[[group_var]]) < 2 || #can be no less than 2 disease groups
+        nlevels(dat_g[[fraction_var]]) < 2) next #can be no less than 2 fractions present
+    
+    #Try both models
+    model_noint <- try(lmer(reduced_formula, data = dat_g, REML = FALSE), silent = TRUE)
+    model_full <- try(lmer(full_formula, data = dat_g, REML = FALSE), silent = TRUE)
+    
+    #skip test if error occurs
+    if (inherits(model_noint, "try-error") || inherits(model_full, "try-error")) next
+    if (any(is.na(fixef(model_full)))) next
+    
+    #perform anova, skip if error occurs
+    an <- try(anova(model_noint, model_full), silent = TRUE)
+    if (inherits(an, "try-error")) next
+    
+    #store p value and chi-squared from anova
+    pval <- an$`Pr(>Chisq)`[2]
+    chisq <- an$Chisq[2]
+    if (is.na(pval)) next
+    #store marginal r2 explained by the Condition:Fraction interaction ('fractionation shift by disease' size effect)
+    r2_noint <- suppressWarnings(r2_nakagawa(model_noint)$R2_marginal)
+    r2_full  <- suppressWarnings(r2_nakagawa(model_full)$R2_marginal)
+    
+    ## store all results in a table
+    results[[gene]] <- tibble(
+      Genes = gene,
+      dataset = dataset_label,
+      groups_tested = paste(group_levels, collapse = "_"),
+      reference_group = ref_group,
+      n_obs = nrow(dat_g),
+      n_subjects = n_distinct(dat_g[[subject_var]]),
+      chi_sq = chisq,
+      p_value = pval,
+      delta_margin_r2 = r2_full - r2_noint,
+      singular_reduced = isSingular(model_noint, tol = 1e-4),
+      singular_full = isSingular(model_full, tol = 1e-4))
+  }
+  
+  #all genes tested, adjusted for 4794 tests (checked this)
+  out <- bind_rows(results) %>%
+    mutate(padj = p.adjust(p_value, method = fdr_method)) %>%
+    arrange(padj, p_value)
+  
+  list(full_list_mixmod = out, significant_mixmod = out %>% filter(padj < 0.05))
+}
+```
+
+
+## Fit both assays and identify robust results
+
+Robust hits are the intersection of significant imputed and unimputed results. 
+Count: 217  results robus to imputation strategy
+
+```{r fit-disease-models}
+# ------------------------------------------------------------
+# 8. #run both analyses in parallel
+# ------------------------------------------------------------
+res_unimp <- fit_fraction_interaction_models( 
+  gene_list = model_gene_list,
+  dataframe = prop_long,
+  assay_to_use = "unimputed",
+  dataset_label = "unimputed",
+  group_levels = c("CON", "RES", "AD-DEM"),
+  ref_group = "CON",
+  scale_continuous = TRUE)
+
+res_unimp$significant_mixmod %>% arrange(desc(delta_margin_r2))
+
+res_imp <- fit_fraction_interaction_models(
+  gene_list = model_gene_list,
+  dataframe = prop_long,
+  assay_to_use = "imputed",
+  dataset_label = "imputed",
+  group_levels = c("CON", "RES", "AD-DEM"),
+  ref_group = "CON",
+  scale_continuous = TRUE)
+
+## identify robust results
+stable_genes <- intersect(res_imp$significant_mixmod$Genes, res_unimp$significant_mixmod$Genes)
+stable_results <- res_unimp$significant_mixmod %>% filter(Genes %in% stable_genes) %>% arrange(p_value)
+
+gene_pg_map <- prop_long %>% dplyr::select(Protein.Group, First.Protein.Description, Genes) %>% distinct()
+stable_results <- stable_results %>% arrange(desc(delta_margin_r2)) %>% left_join(gene_pg_map, by = "Genes")
+
+## store results
+#write_csv(stable_results, "stable_217_CON_AD_RES.csv")
+#write_csv(res_unimp$full_list_mixmod, "unimp_results_CON_AD_RES.csv")
+#write_csv(res_imp$full_list_mixmod, "imp_results_CON_AD_RES.csv")
+```
+
+
+## Figure 3C: Disease-model results
+
+
+```{r disease-volcano}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(paletteer)
+library(scales)
+
+df <- as_tibble(res_unimp$full_list_mixmod) %>% mutate(log10pval = -log10(p_value))
+
+# ------------------------------------------------------------
+# Select top labels
+# ------------------------------------------------------------
+top_pval <- df %>% filter(padj < 0.05) %>% slice_max(order_by = log10pval, n = 50)
+top_r2 <- df %>% filter(padj < 0.05) %>% slice_max(order_by = abs(delta_margin_r2), n = 50)
+
+top_labels <- bind_rows(top_pval, top_r2) %>% distinct(Genes, .keep_all = TRUE)
+
+# split labels by robust vs not robust
+top_labels_stable <- top_labels %>%  filter(Genes %in% stable_results$Genes)
+top_labels_nonstable <- top_labels %>% filter(!(Genes %in% stable_results$Genes))
+
+# ------------------------------------------------------------
+# Volcano plot
+# ------------------------------------------------------------
+plot_unimp <- ggplot(df, aes(x = delta_margin_r2, y = log10pval, color = padj)) +
+
+  # non-significant background
+  geom_point(
+    data = filter(df, padj >= 0.05),
+    color = "grey85",
+    size = 1.5,
+    alpha = 0.5) +
+
+  # significant points
+  geom_point(
+    data = filter(df, padj < 0.05),
+    size = 1.8) +
+
+  # robust labels
+  geom_label_repel(
+  data = top_labels_stable,
+  aes(label = Genes, color = padj),
+  size = 3,
+  fontface = "bold",
+  max.overlaps = 30,
+  max.iter = 20000,
+  box.padding = 0.3,
+  label.padding = 0.15,
+  label.r = 0.15,
+  label.size = 0,
+  fill = alpha("white", 0.9)) +
+
+  # colour scale
+  scale_color_paletteer_c(
+    "ggthemes::Red-Gold",
+    direction = -1,
+    name = "FDR (padj)") +
+
+  #labels
+  labs(
+    x = expression(Delta*" marginal R"^2),
+    y = expression(-log[10](p-value))) +
+
+  #consistent 10 pt Helvetica theme
+  theme_classic(
+    base_size = 10,
+    base_family = "Helvetica") +
+
+  theme(
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "right")
+
+plot_unimp
+```
+
+
+## Figure 3B: APP, NPTX2 and SMOC1 profiles
+
+```{r abundance-and-proportional-profiles}
+condition_palette <- c("CON" = "royalblue1", "RES" = "yellowgreen", "AD-DEM" = "indianred2")
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+selection <- c("APP", "NPTX2", "SMOC1") # Figure 3B manuscript exemplars.
+
+# ------------------------------------------------------------
+# 1) Log2-intensity summary
+# ------------------------------------------------------------
+ribbon_plots_log <- prop_long %>%
+  filter(Genes %in% selection, assay_type == "imputed") %>%
+  mutate(
+    Fraction = factor(Fraction),
+    log2Quant = log2(value)) %>%
+  group_by(Group, Fraction, Genes) %>%
+  summarise(
+    n = sum(!is.na(log2Quant)),
+    mean_log2 = mean(log2Quant, na.rm = TRUE),
+    sdev = sd(log2Quant, na.rm = TRUE),
+    sem = sdev / sqrt(n),
+    .groups = "drop")
+
+logscale_plot <- ggplot(
+  ribbon_plots_log,
+  aes(x = as.numeric(Fraction), y = mean_log2,
+      color = Group, group = Group, fill = Group)) +
+  geom_ribbon(
+    aes(ymin = mean_log2 - sem, ymax = mean_log2 + sem),
+    alpha = 0.4, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1, alpha = 0.9) +
+  facet_wrap(~Genes, ncol = length(unique(ribbon_plots_log$Genes)), scales = "fixed") +
+  scale_x_continuous(breaks = 1:7) +
+  scale_color_manual(values = condition_palette) +
+  scale_fill_manual(values = condition_palette) +
+  labs(
+    x = NULL,
+    y = "Mean log\u2082(intensity) ± SEM") +
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.8),
+    strip.text = element_text(size = 10, face = "bold"),
+    strip.background = element_blank(),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 10))
+
+# ------------------------------------------------------------
+# 2) Proportional abundance summary
+# ------------------------------------------------------------
+ribbon_plots_prop <- prop_long %>%
+  filter(Genes %in% selection, assay_type == "imputed") %>%
+  mutate(Fraction = factor(Fraction)) %>%
+  group_by(Group, Fraction, Genes) %>%
+  summarise(
+    n = sum(!is.na(prop)),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sdev = sd(prop, na.rm = TRUE),
+    sem = sdev / sqrt(n),
+    .groups = "drop")
+
+propscale_plot <- ggplot(
+  ribbon_plots_prop,
+  aes(x = as.numeric(Fraction), y = mean_prop,
+      color = Group, group = Group, fill = Group)) +
+  geom_ribbon(
+    aes(ymin = mean_prop - sem, ymax = mean_prop + sem),
+    alpha = 0.4, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1, alpha = 0.9) +
+  facet_wrap(~Genes, ncol = length(unique(ribbon_plots_log$Genes)), scales = "fixed") +
+  scale_x_continuous(breaks = 1:7) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  scale_color_manual(values = condition_palette) +
+  scale_fill_manual(values = condition_palette) +
+  labs(x = "Fraction", y = "Mean proportion ± SEM") +
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.8),
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 10))
+
+# ------------------------------------------------------------
+# 3) Patchwork: log2 above, proportion below
+# ------------------------------------------------------------
+log_prop_plot <- logscale_plot / propscale_plot +
+  plot_layout(heights = c(1, 1))
+
+log_prop_plot
+```
+
+
+## Figure 3D: Protein-complex profiles
+
+- AP3, dynactin and spliceosomal profiles.
+
+```{r complex-profiles}
+ribbon_plots_prop <- prop_long %>%
+  filter(assay_type == "imputed", Genes %in% c("AP3M2","AP3D1","AP3B2","AP3S2",
+                                               "SNRPA","SNRNP70","SNRPD2", "SNRPD3",
+                                               "DCTN1","DCTN2","DCTN3", "DCTN4")) %>%
+  mutate(
+    #Genes = factor(Genes, levels = gene_order),
+    Fraction = factor(Fraction),
+    log2Quant = log2(value)) %>%
+  group_by(Group, Fraction, Genes) %>%
+  summarise(
+    n = sum(!is.na(prop)),
+    mean_prop = mean(prop, na.rm = TRUE),
+    sdev = sd(prop, na.rm = TRUE),
+    sem = sdev / sqrt(n),
+    .groups = "drop")
+
+prop_plot <- ggplot(ribbon_plots_prop, aes(x = Fraction, y = mean_prop, 
+                                           color = Group, group = Group, fill = Group)) +
+  # SEM Ribbon and Mean Line
+  geom_ribbon(aes(ymin = mean_prop - sem, ymax = mean_prop + sem), alpha = 0.4, color = NA) +
+  geom_line(size = 0.8) +
+  geom_point(size = 1, alpha = 0.8) +
+  labs(x = "Fraction", y = "Mean proportional intensity ±SEM",
+    color = "Condition", fill = "Condition") +
+  facet_wrap(~Genes, ncol = 4, scales = "free_y") +
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  #theme(legend.position = "none", panel.border = element_rect(color = "grey", fill = NA, size = 0.8),
+        #strip.text = element_text(colour = "black", size = 10, face = "bold"),
+        #axis.text.x = element_text(size = 8),  #axis labels
+        #axis.text.y = element_text(size = 6),
+        #axis.title.x = element_text(size = 8),
+        #axis.title.y = element_text(size = 8)) +
+  theme(
+  legend.position = "none",
+  panel.border = element_rect(color = "grey", fill = NA, size = 0.8),
+
+  strip.text = element_text(colour = "black", size = 10, face = "bold"),
+  strip.background = element_blank(),   # remove grey box
+
+  axis.text.y  = element_blank(),       # remove x tick labels
+  axis.title.y = element_blank(),       # remove x title
+  axis.ticks.y = element_blank(),       # remove ticks
+
+  axis.text.x = element_text(size = 10),
+  axis.title.x = element_text(size = 10)) +
+  scale_color_manual(values = condition_palette) +
+  scale_fill_manual(values = condition_palette) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.01))
+
+#library(patchwork)
+
+prop_plot
+```
+
+
+## Figure 3E: GO cellular-component enrichment
+
+```{r disease-go-enrichment}
+#pulling out protein groups for mapping
+gene_pg_map <- prop_long %>% dplyr::select(Genes, Protein.Group) %>% distinct()
+
+#read in full contrasts file (ad vs con vs res)
+modelres <- as_tibble(res_unimp$full_list_mixmod) %>% 
+  left_join(gene_pg_map, by = "Genes")
+imp <- as_tibble(res_imp$full_list_mixmod) %>% filter(padj <0.05) %>% left_join(gene_pg_map, by = "Genes")
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+
+# significant genes per contrast
+sig_list <- modelres %>% filter(padj < 0.05, Protein.Group %in% imp$Protein.Group) %>%
+  group_by(groups_tested) %>%
+  summarise(entry = list(unique(Protein.Group)), .groups = "drop")
+
+# background (all tested genes)
+bg_genes <- unique(modelres$Protein.Group)
+length(bg_genes)
+
+#Convert to Entrez
+all_genes <- unique(c(bg_genes,
+  unlist(sig_list$entry)))
+
+gene_map <- bitr(
+  all_genes, fromType = "UNIPROT",   toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db)
+
+bg_entrez <- gene_map %>%
+  filter(UNIPROT %in% bg_genes) %>% pull(ENTREZID) %>% unique()
+
+sig_list <- sig_list %>%
+  mutate(entrez = lapply(entry, function(g) {
+    gene_map %>% filter(UNIPROT %in% g) %>%
+      pull(ENTREZID) %>%
+      unique()
+  }))
+
+## here I want to split by groups_tested, run enrichment analysis on each unique comparison tested
+ego_list <- lapply(seq_len(nrow(sig_list)), function(i) {
+  
+  contrast_name <- sig_list$groups_tested[i]
+  gene_set <- sig_list$entrez[[i]]
+  
+  # skip small sets
+  if (length(gene_set) < 20) return(NULL)
+  
+  ego <- enrichGO(
+    gene          = gene_set,
+    universe      = bg_entrez,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENTREZID",        #Uniprot IDs
+    ont           = "CC",
+    pAdjustMethod = "BH",   #within-test correction
+    qvalueCutoff  = 0.5,
+    readable      = TRUE)
+  
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) return(NULL)
+  
+  df <- as.data.frame(ego)
+  df$contrast <- contrast_name
+  df
+})
+
+ego_df <- bind_rows(ego_list) %>%
+  mutate(Strength = log10(FoldEnrichment)) %>%
+  arrange(desc(Strength)) %>%
+  distinct(geneID, .keep_all = TRUE)
+```
+
+
+## Figure 3E: GO themes and significance annotations
+
+```{r go-themes}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# ---- 1) Clean + assign themes ----
+top_terms <- ego_df %>%
+  #filter(Count > 7) %>%
+  mutate(
+    theme = case_when(
+      str_detect(Description, regex("snRNP|splice|methylosome", TRUE)) ~ "RNA splicing",
+      str_detect(Description, regex("AP-|coat|endosome|retromer|vesicle", TRUE)) ~ "Vesicle trafficking",
+      str_detect(Description, regex("axon|projection|presynapse|growth cone", TRUE)) ~ "Neuronal compartment",
+      str_detect(Description, regex("microtubule|dynactin", TRUE)) ~ "Cytoskeleton",
+      str_detect(Description, regex("cytoplas", TRUE)) ~ "Cytoplasm",
+      TRUE ~ "Other"),
+    term = Description)
+
+# ---- 2) Order terms within theme ----
+top_terms <- top_terms %>%
+  arrange(theme, desc(Strength)) %>%
+  group_by(theme) %>%
+  mutate(term = factor(term, levels = unique(term))) %>%
+  ungroup()
+
+# ---- 3) Set theme order (important for consistent layout) ----
+top_terms$theme <- factor(top_terms$theme, levels = c(
+  "RNA splicing",
+  "Vesicle trafficking",
+  "Neuronal compartment",
+  "Cytoskeleton",
+  "Cytoplasm",
+  "Other"))
+
+# ---- 4) Custom colour palette ----
+theme_cols <- c(
+  "RNA splicing" = "#2C7FB8",
+  "Vesicle trafficking" = "#C77CFF",
+  "Neuronal compartment" = "#1B9E77",
+  "Cytoskeleton" = "#D95F02",
+  "Cytoplasm" = "#E7298A",
+  "Other" = "darkcyan")
+
+ego_df <- ego_df %>%
+  mutate(sig = case_when(
+    p.adjust < 0.001 ~ "***",
+    p.adjust < 0.01  ~ "**",
+    p.adjust < 0.05  ~ "*",
+    TRUE ~ ""
+  ))
+
+ego_df %>% dplyr::select(Description, sig)
+unique_genes <- ego_df$geneID %>%
+  str_split("/") %>%
+  unlist() %>%
+  unique()
+
+#write_csv(ego_df, "GOCC_217_CON_AD_RES.csv")
+```
+
+
+## Figure 3E: Enrichment plot
+
+```{r go-plot}
+CC_plot <- ggplot(top_terms, aes(x = Strength, y = term)) +
+  
+  # lollipop stems
+  geom_segment(
+    aes(x = 0, xend = Strength, yend = term),
+    colour = "grey85",
+    linewidth = 0.6) +
+  
+  # lollipop points
+  geom_point(
+    aes(size = Count, colour = theme),
+    alpha = 0.8) +
+  
+  # facet by theme (no labels)
+  facet_grid(
+  rows = vars(theme),
+  scales = "free_y",
+  space = "free_y") +
+  
+  scale_colour_manual(values = theme_cols) +
+  
+  scale_size_continuous(
+  range = c(2, 6),
+  breaks = c(5, 15, 35, 50),
+  limits = c(4, 50)) +
+  
+  labs(
+    x = expression(log[10]*"(fold enrichment)"),
+    y = NULL,
+    colour = "Theme",
+    size = "Count") +
+  
+  theme_classic(
+    base_size = 10,
+    base_family = "Helvetica") +
+  
+  theme(
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0.4, "lines"),
+    
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    
+    legend.position = "right")
+CC_plot
+```
