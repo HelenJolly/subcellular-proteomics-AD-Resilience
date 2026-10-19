@@ -1,0 +1,354 @@
+---
+title: "Figure 5: Tau peptide fractionation profiles"
+output: Markdown file
+---
+
+## Purpose
+
+DIA-NN precursor filtering, median aggregation of unmodified peptide sequences, tau 2N4R sequence mapping and plotting of selected tau peptide profiles. Note that reference cytoskeletal/cytosolic profiles can be obtained in the figure 2Ci section, see filter(markers %in% c("Cytoskeleton", "Cytosol")).
+
+## Access and execution
+
+Code is available for inspection can be run using the supplementary MAPT peptide data provided. Restricted participant-level inputs and intermediate objects are not included. Access to any ROSMAP clinical and neuropathological data is subject to the applicable data-use agreements, and can be requested through https://www.radc.rush.edu/ and https://www.synapse.org/. 
+
+## Inputs
+
+- `report.pr_matrix.tsv`: DIA-NN precursor matrix output
+- `mapnamesreport.csv`: run-layout mapping; `contaminants.csv`: contaminant list.
+- `demogs.xlsx`: restricted subject metadata (only Subject/Group used here).
+
+```{r display-settings, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Import, map and filter precursor entries
+
+Original exclusions and filtering order are retained. Excluding semicolon-containing identifiers is described by the code itself; no new proteotypicity criterion has been added.
+
+```{r precursor-import}
+library(data.table)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readxl)
+
+# -------------------------------
+# 1) Read wide precursor matrix
+# -------------------------------
+f <- "path/to/report.pr_matrix.tsv" #can be downloaded from ProteomeXchange. Input path for local directory it is saved to.
+
+report_wide <- as.data.table(read_tsv(f))
+
+# metadata columns present in the DIA-NN precursor matrix
+meta_cols <- c(
+  "Protein.Group",
+  "Protein.Ids",
+  "Protein.Names",
+  "Genes",
+  "First.Protein.Description",
+  "Proteotypic",
+  "Stripped.Sequence",
+  "Modified.Sequence",
+  "Precursor.Charge",
+  "Precursor.Id")
+
+# all other columns are run columns
+run_cols <- setdiff(names(report_wide), meta_cols)
+
+
+# -------------------------------
+# 2) Pivot wide -> long
+# -------------------------------
+report <- melt(
+  report_wide,
+  id.vars = meta_cols,
+  measure.vars = run_cols,
+  variable.name = "Run",
+  value.name = "Quant",
+  variable.factor = FALSE)
+
+rm(report_wide)
+
+# -------------------------------
+# 3) Clean run names and create canonical RunID, as with protein matrix
+# -------------------------------
+prefix <- "^.*/" # Remove acquisition-directory prefixes.
+report[, Run := sub(prefix, "", Run)]
+report[, Run := sub("\\.mzML$", "", Run)]
+report[, Run := sub("_[0-9]{14}(?=\\s|$)", "", Run, perl = TRUE)]
+report[, Run := gsub(" ", "_", Run, fixed = TRUE)]
+
+# extract plate / well from run name
+tmp <- sub(".*P([0-9]+)_W([0-9]+).*", "\\1;\\2", report$Run)
+spl <- tstrsplit(tmp, ";", fixed = TRUE)
+report[, `:=`(
+  Plate_num = as.integer(spl[[1]]),
+  Well_num  = as.integer(spl[[2]])
+)]
+rm(tmp, spl)
+
+report[, RunID := paste0("P", Plate_num, "_W", Well_num)]
+
+# remove non-experimental wells
+report <- report[!(RunID %in% c("P7_W17"))]
+
+# -------------------------------
+# 4) Map to experimental layout
+# -------------------------------
+mapnames <- fread(input_file("mapnamesreport.csv"))
+# expected columns: original_names, new_name
+setnames(mapnames, old = intersect(names(mapnames), c("original_names")), 
+         new = "RunID_old", skip_absent = TRUE)
+setnames(mapnames, old = intersect(names(mapnames), c("new_name")), 
+         new = "RunID_new", skip_absent = TRUE)
+
+setkey(report, RunID)
+setkey(mapnames, RunID_old)
+
+report[mapnames, RunID := fcoalesce(i.RunID_new, RunID)]
+
+# split mapped RunID if now in format Plate-Well-Subject-Fraction
+report[, c("Plate", "Well", "Subject", "Fraction") := tstrsplit(RunID, "-", fixed = TRUE, fill = NA)]
+
+# -------------------------------
+# 5) Remove contaminants
+# -------------------------------
+contaminants <- fread(input_file("contaminants.csv"))
+
+
+report <- report[
+  !grepl("cRAP", Protein.Group, fixed = TRUE) & #remove if flagged cRAP in DIANN search
+    endsWith(Protein.Names, "_HUMAN") & #remove any non-human entries
+    !(Protein.Group %in% contaminants$Accession |
+        Genes %in% contaminants$Gene_symbol)
+]
+
+# -------------------------------
+# 5) Remove non-proteotypic entries
+# -------------------------------
+
+report <- report[
+  !grepl(";", Protein.Group, fixed = TRUE) & #remove if non-proteotypic peptide
+    !grepl(";", Genes, fixed = TRUE) 
+]
+
+# -------------------------------
+# Drop unneeded helper columns
+# -------------------------------
+drop_cols <- c("Run", "Plate_num", "Well_num")
+report[, (intersect(drop_cols, names(report))) := NULL]
+
+#  ordering
+setcolorder(report, c("RunID", "Plate", "Well", "Subject", "Fraction", meta_cols, "Quant"))
+```
+
+
+## Missingness filtering and median peptide aggregation
+
+```{r precursor-filter-and-aggregate}
+library(data.table)
+
+# ------------------------------------------------------------------
+# 6) remove technical samples
+# - Fraction missing (or Pool)
+# - FracPools are Subject %in% c("A8","C5","E3","G1","J8") 
+# - known failed run >= 80% missingness P4-W76-G2-2p
+# ------------------------------------------------------------------
+
+report <- report[
+  !is.na(Fraction) &
+    Fraction != "Pool" &
+    !Subject %in% c("A8","C5","E3","G1","J8") & #Fractionated pools
+    RunID != "P4-W76-G2-2p"]
+
+# counts after technical sample removal are same as after contaminant removal
+# ------------------------------------------------------------------
+# 7) remove precursors with >=70% global missingness across runs
+# ------------------------------------------------------------------
+precursor_missingness <- report[, .(
+  prop_missing = mean(is.na(Quant))), by = Precursor.Id]
+
+keep_precursors <- precursor_missingness[prop_missing < 0.7, Precursor.Id]
+report <- report[Precursor.Id %in% keep_precursors]
+
+# ------------------------------------------------------------------
+# 8): median aggregate precursor ions to peptide level
+# one row per peptide x run
+# ------------------------------------------------------------------
+
+peptide_report <- report[, .(
+  Quant = if (all(is.na(Quant))) NA_real_ else median(Quant, na.rm = TRUE)), by = .(
+  Protein.Group, First.Protein.Description, Genes, Stripped.Sequence, RunID, Plate, Well, Subject, Fraction)]
+
+#order columns
+setcolorder(
+  peptide_report,
+  c("RunID", "Plate", "Well", "Subject", "Fraction",
+    "Protein.Group", "First.Protein.Description", "Genes", "Stripped.Sequence", "Quant"))
+
+#inspect
+head(peptide_report)
+
+#save locally as cleaned PR matrx
+#write_csv(peptide_report, output_file("clean_pr_matrix.csv")) 
+```
+
+## Select MAPT peptides and map to tau 2N4R sequence
+
+-the aa sequence was copied from UniProt
+
+```{r tau-sequence-mapping}
+
+MAPT <- peptide_report %>% filter(Protein.Group == "P10636" | Genes == "MAPT")
+length(unique(MAPT$Stripped.Sequence)) #29
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+
+# N to C terminal order of 2N4R sequence from uniprot
+tau_2N4R <- paste0(
+  "MAEPRQEFEVMEDHAGTYGLGDRKDQGGYTMHQDQEGDTDAGLKESPLQTPTEDGSEEPGSETSDAKSTPTAEDVTAPLVDEGAPGKQAAAQPHTEIPEGTTAEEAGIGDTPSLEDEAAGHVTQARMVSKSKDGTGSDDKKAKGADGKTKIATPRGAAPPGQKGQANATRIPAKTPPAPKTPPSSGEPPKSGDRSGYSSPGSPGTPGSRSRTPSLPTPPTREPKKVAVVRTPPKSPSSAKSRLQTAPVPMPDLKNVKSKIGSTENLKHQPGGGKVQIINKKLDLSNVQSKCGSKDNIKHVPGGGSVQIVYKPVDLSKVTSKCGSLGNIHHKPGGGQVEVKSEKLDFKDRVQSKIGSLDNITHVPGGGNKKIETHKLTFRENAKAKTDHGAEIVYKSPVVSGDTSPRHLSNVSSTGSIDMVDSPQLATLADEVSASLAKQGL") 
+
+
+# find where MAPT peptides sit in N->C sequence 
+mapt_peptides <- sort(unique(MAPT$Stripped.Sequence))
+
+peptide_pos <- tibble(Stripped.Sequence = mapt_peptides) %>%
+  mutate(match = str_locate(tau_2N4R, fixed(Stripped.Sequence))[, 1],
+         end   = str_locate(tau_2N4R, fixed(Stripped.Sequence))[, 2]) %>%
+  arrange(match, end, Stripped.Sequence)
+peptide_pos # 24/29 are found in 2N4R sequence (others are in full canonical sequence)
+```
+
+
+## Prepare profiles
+
+Applies a <5% peptide-missingness filter, sequence-position matching and peptide ranges. The 5 unmatched 2N4R sequences are excluded.
+
+```{r tau-peptide-selection}
+library(data.table)
+
+### Join by demogs to map disease group (CON/RES/AD-DEM)
+demogs <- readxl::read_xlsx("demogs.xlsx") %>% dplyr::select(Subject, Group) 
+
+# Identify low missingness peptides (less then 5% missingness)
+setDT(MAPT)
+mapt_missingness <- MAPT[, .(
+  prop_missing = mean(is.na(Quant))), by = Stripped.Sequence]
+keep_precursors <- mapt_missingness[prop_missing < 0.05, Stripped.Sequence]
+MAPT <- MAPT[Stripped.Sequence %in% keep_precursors]
+
+length(unique(MAPT$Stripped.Sequence)) #10/29 sequences have 0 missingness, 18 have missingness < 5%
+
+MAPT_plot <- MAPT %>%
+  left_join(demogs, by = "Subject") %>%
+  mutate(Fraction = factor(Fraction, levels = as.character(1:7)),
+    Group = factor(Group, levels = c("CON", "RES", "AD-DEM"))) %>%
+  group_by(Subject, Stripped.Sequence) %>%
+  mutate(log2Quant = log2(Quant),
+    total_peptide = sum(Quant, na.rm = TRUE),
+    prop = if_else(total_peptide > 0, Quant / total_peptide, NA_real_)) %>%
+  ungroup() %>%
+  left_join(peptide_pos, by = "Stripped.Sequence") %>%
+  mutate(
+    peptide_label = paste0(Stripped.Sequence, " (", match, "-", end, ")"),
+    peptide_label = factor(
+      peptide_label,
+      levels = unique(paste0(peptide_pos$Stripped.Sequence, " (", peptide_pos$match, "-", peptide_pos$end, ")")))) %>% filter(!is.na(match) | !is.na(end)) 
+
+ranges <- c(
+  "6-23",
+  "45-67",
+  "181-190",
+  "195-209",
+  "212-224",
+  "260-267",
+  "282-290",
+  "299-311",
+  "354-369",
+  "396-406")
+
+filtered_peps <- MAPT_plot %>% filter(grepl(paste(ranges, collapse = "|"), peptide_label))
+```
+
+
+## Summarise log2 and proportional peptide abundance
+
+- note that there are 24-25 possible observations each peptide per disease-fraction
+- 24 in fraction 7 due to the removal of the failed sample in fraction 2. Otherwise, 25 for each person per CON/RES/AD-DEM group. Only the observed peptides used in mean and SD caluclations here. 
+
+```{r tau-summary}
+MAPT_prop_sum <- filtered_peps %>%
+  group_by(Group, Fraction, peptide_label, match) %>%
+  summarise(
+    n_obs = sum(!is.na(prop)),
+    mean_prop = sum(prop, na.rm = TRUE)/n_obs, 
+    sd = sd(prop, na.rm = TRUE),
+    sem = sd / sqrt(n_obs), 
+    .groups = "drop")
+
+MAPT_log_sum <- filtered_peps %>%
+  group_by(Group, Fraction, peptide_label, match) %>%
+  summarise(
+    n_obs = sum(!is.na(log2Quant)),
+    mean_log2Quant = sum(log2Quant, na.rm = TRUE)/n_obs,
+    sd = sd(log2Quant, na.rm = TRUE),
+    sem = sd / sqrt(n_obs),
+    .groups = "drop")
+
+```
+
+
+## Figure 5: Plot peptide profiles in sequence order
+
+
+```{r tau-profile-plots}
+
+condition_palette <- c("CON" = "royalblue1", "RES" = "yellowgreen", "AD-DEM" = "indianred2")
+prop_plot <- ggplot(
+  MAPT_prop_sum,
+  aes(x = Fraction, y = mean_prop, color = Group, group = Group)) +
+  geom_ribbon(
+    aes(ymin = mean_prop - sem, ymax = mean_prop + sem, fill = Group, color = NULL),
+    alpha = 0.35) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1) +
+  facet_wrap(~ peptide_label, scales = "fixed", ncol = 10) +
+  scale_color_manual(values = condition_palette) +
+  scale_fill_manual(values = condition_palette) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) +
+  labs(x = "Fraction",  y = "Mean proportion (±SEM)",
+    color = "Group", fill = "Group") +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "top",
+        plot.title  = element_text(size   = 14, face = "bold"),
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.8),
+    strip.text = element_text(size = 4, face = "bold"))
+
+log_plot <- ggplot(
+  MAPT_log_sum,
+  aes(x = Fraction, y = mean_log2Quant, color = Group, group = Group)) +
+  geom_ribbon(
+    aes(ymin = mean_log2Quant - sem, ymax = mean_log2Quant + sem, fill = Group, color = NULL),
+    alpha = 0.35) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1) +
+  facet_wrap(~ peptide_label, scales = "fixed", ncol = 10) +
+  scale_color_manual(values = condition_palette) +
+  scale_fill_manual(values = condition_palette) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 1)) +
+  labs(x = "Fraction",  y = "Mean log2 intensity (±SEM)",
+       #subtitle = "all peptides at <5% missingness",
+    color = "Group", fill = "Group") +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "none",
+        plot.title  = element_text(size   = 14, face = "bold"),
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.8),
+    strip.text = element_text(size = 4, face = "bold"))
+
+library(patchwork)
+prop_plot / log_plot
+```
