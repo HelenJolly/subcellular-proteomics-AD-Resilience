@@ -16,7 +16,7 @@ This code is for inspection. Restricted participant-level inputs and intermediat
 - `localisation_Apr26.csv`: produced by `scriptforscreen.R`.
 - `MAI_prot_model_new.rds`: SummarizedExperiment obtain, available at proteomeXchange
 - `demogs`: restricted subject metadata (`Subject`, `Group`, `age_death`, `msex`, `pmi`).
-- `Johnson22_prots_full.xlsx`: Johnson et al., 2022. external bulk-proteomics file, downloaded from [LINK] the available supplementary data section.
+- `Johnson_2022.xlsx`: external bulk-proteomics file, downloaded from the Supplementary Informtaion: 'Supplementary Tables' at DOI:10.1038/s41593-021-00999-y 
 
 - GO:CC gene sets from msigdbr are retrieved at execution, using the original annotation/software versions.
 
