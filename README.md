@@ -10,6 +10,7 @@ This repository contains R Markdown workflow for a study of subcellular proteomi
 | `Figure2_subcell_profiles.Rmd` | Protein fractionation profile clustering, GO:CC enrichment, curated marker profile visualisation, t-SNE and within-group subject correlations | Figure 2A, 2C, 2D and Supplementary Figure S2 |
 | `Figure3_Modelling_categorical.Rmd` | Relative predictor importance, disease-by-fraction mixed models, comparison of imputed and unimputed results, protein profiles and GO:CC enrichment | Figure 3A–E |
 | `Figure3_Modelling_Resilience.Rmd` | Longitudinal cognition modelling, derivation of resilience scores and resilience-by-fraction mixed models | Figure 3F–H |
+| `Figure5_peptide_analysis.Rmd` | Peptide-level filtering, MAPT peptide inspection, mapping, and plotting | Figure 5 |
 
 ## Data availability
 
@@ -75,6 +76,10 @@ Additional required inputs are:
 - `demogs.xlsx`
 
 The protein preparation and eligibility sections of `Figure3_Modelling_categorical.Rmd` need to be run before the resilience workflow. Intermediate data and model outputs are not included in this repository. 
+
+## MAPT peptides workflow
+
+`Figure5_peptide_analysis.Rmd` imports DIA-NN precursor intensities (These can be downloaded from ProteomeXchange), maps runs to the experimental layout, removes excluded samples and contaminants, and filters by missingness to obtain a clean PR (precursor) matrix. Unmodified precursors are median-aggregated. MAPT peptides with <5% missingness are mapped to the canonical 2N4R sequence and plotted by disease-profile. The accompanying reference cytoskeletal and cytosolic protein-level compartment profiles can be obtained in the figure 2Ci section of `Figure2_subcell_profiles.Rmd`. 
 
 ## Software
 
