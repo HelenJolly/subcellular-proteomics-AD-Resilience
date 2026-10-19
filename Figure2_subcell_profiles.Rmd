@@ -20,8 +20,7 @@ knitr::opts_chunk$set(eval = FALSE)
 
 -  `prop_long` object is derived using the above to generate marker profiles
   
-*Subject-level inputs and generated objects are not distributed with the public
-code. ROSMAP participant-level clinical and neuropathological data can be requested through the Rush Alzheimer’s Disease Center at https://www.radc.rush.edu and AD Knowledge Portal at https://www.synapse.org, subject to the applicable data-use agreements. 
+*Subject-level inputs and generated objects are not distributed with the public code. ROSMAP participant-level clinical and neuropathological data can be requested through the Rush Alzheimer’s Disease Center at https://www.radc.rush.edu and AD Knowledge Portal at https://www.synapse.org, subject to the applicable data-use agreements. 
 
 
 ## Prepare protein intensities and subject-normalised profiles
@@ -71,7 +70,6 @@ prop <- long %>%
          prop = value / sum) %>%
   ungroup()
 ```
-
 
 ## Figure 2A: Mean profiles and Ward D2 clustering
 
@@ -157,20 +155,7 @@ draw(ht,
   legend_grouping = "original")
 ```
 
-
 ## Figure 2A: GO cellular-component enrichment
-
-The background comprises the clustered protein IDs. Original enrichment and
-term-selection settings are preserved, including the second BH adjustment over
-the returned, fold-enrichment-filtered terms. This is not an adjustment over
-all GO tests originally performed. Annotation/package versions are required
-for exact reproduction.
-
-**Unresolved plot metric:** the original lollipop code maps `Signal` to the
-x-axis while labelling it "Strength". `Strength = log10(FoldEnrichment)`;
-`Signal` combines Strength with adjusted significance. The source expression
-is retained here pending confirmation of which metric generated Figure 2A.
-
 
 ```{r go-enrichment}
 ## Extract uniprot codes for GO analysis
@@ -294,7 +279,7 @@ plot_df <- go_top %>%
     term = Description,
     term = tidytext::reorder_within(term, Strength, cluster))
 
-# ---- size legend breaks: rounded to nearest 5 across the plotted data ----
+# ---- size legend breaks (rounded to nearest 5) ----
 min_k <- min(plot_df$Count, na.rm = TRUE)
 max_k <- max(plot_df$Count, na.rm = TRUE)
 min_k5 <- floor(min_k / 5) * 5
@@ -330,14 +315,9 @@ ggplot(plot_df, aes(x = Strength, y = term, color = cluster)) +
   guides(size = guide_legend(override.aes = list(alpha = 1)))
 ```
 
-
 ## Marker input
 
-Load the final assignments produced by the separate curation workflow. The
-source Rmd also filtered and reassigned entries after loading the CSV; these
-steps are intentionally excluded. The input supplied here must already contain
-the final assignments used for the figure.
-
+- plots marker profiles (individual and compartment means +/-SEM)
 
 ```{r load-markers}
 library(readr)
@@ -358,8 +338,6 @@ marker_palette <- c(
 
 plot_palette <- c(marker_palette, "unknown" = "grey80")
 ```
-
-
 ## Marker profiles: Supplementary Figure S2
 
 ```{r marker-profiles}
@@ -391,12 +369,11 @@ ggplot(final_profiles, #then do the same again for log
     legend.position = "none")
 ```
 
-
 ## Figure 2Ci: Compartment mean profiles and SEM
 
 ```{r}
 overall_profile <- final_profiles %>%
-  #filter(markers %in% c("Cytoskeleton", "Cytosol")) %>% #include for the MAPT peptide figure 5
+  #filter(markers %in% c("Cytoskeleton", "Cytosol")) %>% #used for the MAPT peptide profiles in figure 5
   group_by(markers, Fraction) %>%
   summarise(
     n = n(),
@@ -422,12 +399,7 @@ ggplot(overall_profile,
     plot.subtitle = element_text(size = 10))
 ```
 
-
 ## Figure 2Cii: Nuclear/cytosolic and pre-/postsynaptic profiles
-
-The same source `final_profiles` table is used below, so the group-averaging
-question above also applies to these panels.
-
 
 ```{r paired-marker-profiles}
 cii <- final_profiles %>%
@@ -457,24 +429,20 @@ ggplot(cii,
     panel.spacing = unit(0.6, "lines"))
 ```
 
-
-## Figure 2Ciii: t-SNE (input provenance unresolved)
-
-
+## Figure 2Ciii: t-SNE
 
 ```{r tsne}
 #T-sne 
 library(Rtsne)
 
-## Optional but recommended:
 ## scale fractions so t-SNE is not dominated by one fraction.
 mat_scaled <- scale(prop_mat)
 
-## ---- 8) Run t-SNE ----
+## ----  Run t-SNE ----
 set.seed(3)
 tsne_out <- Rtsne(mat_scaled, dims = 2, perplexity = 50, theta = 0.5, pca = TRUE, check_duplicates = FALSE)
 
-## ---- 9) t-SNE coordinates + labels ----
+## ----  t-SNE coordinates + labels ----
 df_tsne <- as.data.frame(tsne_out$Y) %>%
   setNames(c("tSNE1", "tSNE2")) %>% rownames_to_column("Protein.Group")
 
@@ -546,10 +514,7 @@ ggplot(df_tsne, aes(x = tSNE1, y = tSNE2)) +
 - The heatmap diagonal represents self-self correlation
 - the violin plot shows the distribution of pairwise correlation by group (one value per unique pair, excludes the diagnoal)
 
-Heatmaps include self-correlations; violin summaries retain one value per
-unique pair and exclude self-correlations. The source plotting limits are
-preserved. The reported 0.952–0.985 range has not been recomputed here.
-
+Heatmaps include self-correlations; violin summaries retain one value per unique pair and exclude self-correlations. 
 
 ```{r correlation-heatmaps}
 library(dplyr)
@@ -617,7 +582,7 @@ p_ad  <- make_corr_heatmap(corr_input, "AD-DEM", show_legend = FALSE)
 p_res <- make_corr_heatmap(corr_input, "RES", show_legend = TRUE)
 
 # ------------------------------------------------------------
-# Extract pairwise correlations per group
+# obtains pairwise correlations per group
 # ------------------------------------------------------------
 get_pairwise_corrs <- function(df, group_name) {
   
@@ -651,7 +616,7 @@ corr_dist <- bind_rows(
   get_pairwise_corrs(corr_input, "AD-DEM"))
 
 # ------------------------------------------------------------
-# Summary stats if you want to report them
+# Summary stats and plot panel
 # ------------------------------------------------------------
 corr_dist %>%
   group_by(Group) %>%
