@@ -13,14 +13,13 @@ This code is for inspection. Restricted participant-level inputs and intermediat
 
 ## Inputs and dependencies
 
-- `dataset_longitudinal.xlsx`: restricted longitudinal cognition (`projid`, `fu_year`, `cogn_global`, `age_at_visit`).
-- `dataset_cross_sectional.xlsx`: restricted `projid`, `gpath`, `msex`, `educ`.
-- `demogs.xlsx`: restricted `projid`–`Subject` mapping.
+- `dataset_longitudinal.xlsx`: restricted longitudinal cognition scores across follow-up
+- `dataset_cross_sectional.xlsx`: restricted variables used in analyses, such as global pathology, age, sex
+- `demogs.xlsx`: restricted id to subject mapping.
 
 ```{r display-settings, include=FALSE}
 knitr::opts_chunk$set(eval = FALSE)
 ```
-
 
 ## Read and join restricted cognition data
 
@@ -38,7 +37,7 @@ library(readr)
 
 longitud <- readxl::read_xlsx("dataset_longitudinal.xlsx") %>% 
   group_by(projid) %>%
-  mutate(baseline_cog = cogn_global[fu_year == 0][1], #record baseline cog
+  mutate(baseline_cog = cogn_global[fu_year == 0][1], #baseline cog
          baseline_age = age_at_visit[fu_year == 0][1]) %>% ungroup() %>% 
   #filter(projid %in% long_assays$projid) %>%
  dplyr::select(projid, fu_year, cogn_global, baseline_cog, baseline_age) %>%
@@ -54,7 +53,7 @@ resilience_assay <- longitud %>%
   left_join(crossec, by = "projid") %>%
   filter(!is.na(baseline_cog), !is.na(gpath), !is.na(msex)) #!is.na(Subject)
 
-length(unique(resilience_assay$projid)) # 1972/3984 subjects have cog at baseline, sex, and gpath
+length(unique(resilience_assay$projid)) # 1972/3984 subjects have cog at baseline, sex, and gpath (post-mortem global patho score)
 
 # ------------------------------------------------------------
 #demogs for projid - subject mapping
@@ -62,10 +61,9 @@ length(unique(resilience_assay$projid)) # 1972/3984 subjects have cog at baselin
 demogs <- read_excel("demogs.xlsx")
 ```
 
-
 ## Fit the final full-cohort longitudinal model
 
-Inclusion requires at >=3 follow-up (fu) visits and obs for baseline cognition/age, post-mortem pathology score, sex
+Inclusion requires at >=3 follow-up (fu) visits and obs for baseline cognition/age, gpath score, sex
 
 ```{r fit-longitudinal-model}
 library(data.table)
@@ -91,8 +89,7 @@ cog_dt <- unique(
     msex)])
 
 # ------------------------------------------------------------
-# Complete cases
-# Do NOT require Subject to be present
+# Complete cases (not just those with proteomics data)
 # ------------------------------------------------------------
 cog_dt <- cog_dt[
   !is.na(projid) &
@@ -118,13 +115,13 @@ valid_projids <- visit_counts[N >= 3, projid]
 cog_dt <- cog_dt[projid %in% valid_projids] #1768/1972
 
 # ------------------------------------------------------------
-# Factor variables
+# Factor variables, ID and Sex
 # ------------------------------------------------------------
 cog_dt[, projid := factor(projid)]
 cog_dt[, msex := factor(msex)]
 
 # ------------------------------------------------------------
-# Scale / centre continuous variables
+# Scale / centre continuous variables (age, cognition, gpath)
 # ------------------------------------------------------------
 cog_dt[, fu_year_c := fu_year]
 
@@ -197,11 +194,11 @@ setorder(resilience_scores, -resilience_slope)
 # checks
 # ------------------------------------------------------------
 
-# Full ROSMAP cohort
+# Full cohort
 hist(
   resilience_scores_all$resilience_slope,
   breaks = 1000,
-  main = "All ROSMAP participants",
+  main = "All participants",
   xlab = "Resilience slope")
 summary(resilience_scores_all$resilience_slope)
 
@@ -219,10 +216,7 @@ resilience_scores_proteomics <- resilience_scores %>% dplyr::select(-projid)
 
 #write_csv(resilience_scores_proteomics, "resilience_scores.csv")
 ```
-
-
 ## Figure 3F–G: Cognitive trajectories and resilience
-
 
 ```{r trajectory-plots}
 library(data.table)
@@ -292,12 +286,11 @@ gpath_grid[, expected_slope := beta["fu_year_c"] + beta["fu_year_c:gpath_c"] * g
 
 label_df <- res_dt_plot %>%
   as_tibble() %>%
-  filter(
-    gpath_c > quantile(gpath_c, 0.66, na.rm = TRUE),
+  filter(gpath_c > quantile(gpath_c, 0.66, na.rm = TRUE), 
     abs(resilience_slope) > quantile(abs(resilience_slope), 0.85, na.rm = TRUE))
 
 # ============================================================
-# 6) Cognitive trajectories
+# 6) plot cognitive trajectories
 # ============================================================
 
 p_traj <- ggplot() +
@@ -324,7 +317,7 @@ p_traj <- ggplot() +
     legend.position = "none")
 
 # ============================================================
-# 7) Resilience vs pathology
+# 7) Estimated resilience vs pathology
 # ============================================================
 
 p_gpath_resilience <- ggplot(res_dt_plot, aes(x = gpath_c, y = plotted_slope)) +
@@ -358,19 +351,14 @@ p_gpath_resilience <- ggplot(res_dt_plot, aes(x = gpath_c, y = plotted_slope)) +
     legend.title = element_text(size = 10),
     legend.text = element_text(size = 10))
 ```
-
-
 ## Join the newly derived resilience scores to protein inputs
-
 
 ```{r load-protein-context}
 #prop_long, and model_gene_list objects obtained from Modelling.Rmd are required for downstream steps
 prop_long <- prop_long %>% left_join(resilience_scores_proteomics, by = "Subject")
 ```
 
-
 ## Figure 3H: Resilience-by-fraction models
-
 
 ```{r fit-resilience-interactions}
 library(lme4)
@@ -537,8 +525,7 @@ range(intersection$delta_margin_r2) #effect size (marginal R2) range: 0.003-0.08
 #write_csv(res_resilience_imp$full_list_mixmod, "imp_resilience_slope_final.csv")
 ```
 
-
-## Figure 3H: Plot stable resilience results
+## Figure 3H: Plot 'stable' (robust to imputation) resilience results
 
 ```{r resilience-volcano}
 library(ggrepel)
@@ -566,7 +553,7 @@ top_labels <- df %>% filter(padj < 0.05)
 #OR just Label only the 24 stable significant genes
 top_labels <- df %>% filter(padj < 0.05, is_stable)
 #OR the 24 stable and non-stable when R2 > 2% 
-top_labels <- df %>% filter(padj < 0.05, is_stable | (!is_stable & delta_margin_r2 > 0.02)) #
+top_labels <- df %>% filter(padj < 0.05, is_stable | (!is_stable & delta_margin_r2 > 0.02)) 
 
 plot_resilience <- ggplot(
   df, aes(
