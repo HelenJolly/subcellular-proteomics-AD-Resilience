@@ -1,0 +1,1594 @@
+---
+title: "Figure 6: Cohort-scale compartment localisation"
+output: R markdown file
+---
+
+## Purpose
+
+Subject-level TAGM visualisation, weighted multinomial localisation with held-out subjects, compartment summaries, Jensen–Shannon divergence, external abundance comparisons and common-space PCA. GO:CC ranked enrichment supporting Supplementary Figure S5 is also included.
+
+## Access and execution
+
+This code is for inspection. Restricted participant-level inputs and intermediate objects are not included. 
+
+## Inputs and dependencies
+
+- `localisation_Apr26.csv`: produced by `scriptforscreen.R`.
+- `MAI_prot_model_new.rds`: SummarizedExperiment obtain, available at proteomeXchange
+- `demogs`: restricted subject metadata (`Subject`, `Group`, `age_death`, `msex`, `pmi`).
+- `Johnson22_prots_full.xlsx`: Johnson et al., 2022. external bulk-proteomics file, downloaded from [LINK] the available supplementary data section.
+
+- GO:CC gene sets from msigdbr are retrieved at execution, using the original annotation/software versions.
+
+```{r display-settings, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+## Libraries and compartment colours
+
+
+
+```{r libraries-and-palettes}
+library("QFeatures")
+library("pRoloc")
+library("bandle")
+library("tidyverse")
+library("dbscan")
+library("tidyr")
+library("dplyr")
+library("ggplot2")
+library("rlang")
+library("readxl")
+require("mvtnorm")
+require("dplyr")
+require("ggrepel")
+library("SummarizedExperiment")
+library(patchwork)
+library(ggh4x)
+library(msigdbr)
+library(fgsea)
+library(grid)
+library(QFeatures)
+library(pRoloc)
+library(bandle)
+library(tidyverse)
+library(MSnbase)
+library(nnet)        #multinom
+library(rsample)     #vfold_cv (optional)
+library(purrr)
+library(readr)
+library(SummarizedExperiment)
+
+# --- Inputs you already have in your script ---
+# MAI_backtransformed (genes x runs) on linear scale
+# se_log2_07, rowData/colData available
+# marker_vec: named vector Genes -> markers (your filtered marker set)
+#combined_set$Genes (optional: the 217 movers / your target proteins)
+
+
+marker_palette <- c(
+  "Secretory Pathway" = "#FFD700",
+  "Plasma Membrane"   = "#778B00",
+  "Cytosol"           = "#00E2E5",
+  "Cytoskeleton"      = "#FF0010",
+  "Presynapse"        = "#DEA0FD",
+  "Postsynapse"       = "#C8308C",
+  "Peroxisome"        = "#6A33C2",
+  "Mitochondria"      = "#9DCC00",
+  "Nucleus"           = "navy",
+  "Ribosome"          = "#0075DC",
+  "Proteasome"        = "#8B3B00",
+  "Unknown"           = "grey90"  )
+
+condition_palette <- c("CON" = "royalblue1", "RES" = "yellowgreen", "AD-DEM" = "indianred2")
+```
+
+
+## Load local model inputs and marker labels
+
+Explicit handoff replaces session-only inputs. Marker labels come from the assignments actually used in the TAGM script, not a recreated curation procedure.
+
+## Prepare protein intensities and proportional profiles
+
+```{r protein-profiles}
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+
+### load my MAI prot RDS as se_log_07
+se_log2_07 <- readRDS("MAI_prot_model_new.rds")
+se_log2_07 #Summarised experiment, global filter of <0.7 missingness, unimputed and MAI_imputed stored here (both log scaled)
+
+# 2) Extract the imputed assay data and back-transform
+MAI_raw <- 2^(assay(se_log2_07, "MAI_imputed")) %>% 
+  as.data.frame() %>% #convert to dataframe
+  rownames_to_column("feature_id") %>% #set the proteins as a column
+  pivot_longer(-feature_id, names_to = "SampleID", values_to = "value") #pivot long to join with metadata
+
+# 3) extract row/col metadata from SE
+rd <- rowData(se_log2_07) %>% as.data.frame() %>% rownames_to_column("feature_id")
+cd <- colData(se_log2_07) %>% as.data.frame() %>% rownames_to_column("SampleID")
+
+# 4) Join metadata to assay
+long <- MAI_raw %>% #joing long assays with row data
+  left_join(rd, by = "feature_id") %>%
+  left_join(cd, by = "SampleID") %>%
+  left_join(demogs %>% dplyr::select(Subject, Group), by = "Subject")
+
+#sum normalise 
+prop <- long %>%
+  mutate(log2Quant = log2(value)) %>%
+  group_by(Subject, feature_id) %>%
+  mutate(sum = sum(value, na.rm = TRUE),
+         prop = value / sum) %>%
+  ungroup()
+```
+
+
+## Join TAGM predictions to protein profiles
+
+```{r join-tagm}
+tagm_df <- read_csv("localisation_Apr26.csv")
+
+length(unique(tagm_df$Protein.Group))
+unique(tagm_df$tagm.map.allocation)
+
+colnames(tagm_df)[1] <- "col_id" #rename ...1
+
+#left join with subject-level data and protein quantification data
+tagm_df <- tagm_df %>% left_join(prop_long %>% dplyr::select(-markers) %>% 
+           filter(assay_type == "imputed"), by= c("Protein.Group", "Subject")) 
+
+#for subsetting compartment probability columns
+comp_cols <- c("Cytoskeleton","Cytosol","Secretory Pathway","Mitochondria",
+  "Nucleus","Peroxisome","Plasma Membrane","Postsynapse", "Presynapse", "Ribosome","Proteasome")
+```
+
+
+## Inspect confident per-subject assignments
+
+```{r tagm-confidence-summary}
+subject_summary <- tagm_df %>%
+  filter(markers == "unknown") %>%
+  distinct(Subject, Protein.Group, overall_prob) %>%
+  filter(overall_prob >= 0.95) %>%
+  group_by(Subject) %>%
+  summarise(n_high_conf = n(), .groups = "drop")
+
+range(subject_summary$n_high_conf)
+
+# Data required for manuscript supplementary
+tagm_suppl <- tagm_df %>% dplyr::select(
+  Protein.Group, Genes, markers, tagm.map.allocation, tagm.map.probability, 
+  tagm.map.outlier, overall_prob, tagm.map.allocation.pred, Subject, comp_cols) %>% distinct()
+
+#write_csv(tagm_suppl, "TAGM_MAP_predictions.csv")
+```
+
+
+## Figure 6A: Before/after TAGM t-SNE
+
+Subject H8 is the manuscript example; seed 6, perplexity 50, theta 0.5 and fraction-column scaling are retained.
+
+```{r tagm-tsne}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(Rtsne)
+
+## ---------------------------
+## 1) Filter subject H8 (source exemplar)
+## ---------------------------
+df_H8 <- tagm_df %>% filter(Subject == "H8")
+
+## ---------------------------
+## 2) Build proportional matrix
+## ---------------------------
+prop_mat <- df_H8 %>%
+  dplyr::select(Protein.Group, Fraction, prop) %>%
+  group_by(Protein.Group, Fraction) %>%
+  summarise(prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Fraction, values_from = prop) %>%
+  mutate(across(-Protein.Group, as.numeric)) %>%
+  column_to_rownames("Protein.Group")
+
+## clean matrix
+prop_mat <- prop_mat[complete.cases(prop_mat), ]
+
+## ---------------------------
+## 3) t-SNE
+## ---------------------------
+mat_scaled <- scale(prop_mat)
+
+set.seed(6)
+
+tsne_out <- Rtsne(mat_scaled, dims = 2, perplexity = 50, theta = 0.5, pca = TRUE, check_duplicates = FALSE)
+
+df_tsne <- as.data.frame(tsne_out$Y) %>%
+  setNames(c("tSNE1", "tSNE2")) %>%
+  rownames_to_column("Protein.Group")
+
+df_tsne$Protein.Group <- rownames(mat_scaled)
+
+## ---------------------------
+## 4) Labels
+## ---------------------------
+labels_df <- df_H8 %>%
+  dplyr::select(
+    Protein.Group,
+    markers,
+    tagm.map.allocation.pred,
+    overall_prob) %>%
+  distinct() %>%
+  mutate(
+    label_before = ifelse(is.na(markers), "unknown", markers),
+    label_after = case_when(
+      overall_prob >= 0.95 ~ tagm.map.allocation.pred,
+      TRUE ~ "unknown"))
+
+## ---------------------------
+## 5) Merge t-SNE + labels
+## ---------------------------
+df_plot <- df_tsne %>%
+  left_join(labels_df, by = "Protein.Group")
+
+## ---------------------------
+## 6) Long format with ordered panels
+## ---------------------------
+df_plot_long <- bind_rows(
+  df_plot %>%
+    transmute(
+      Protein.Group,
+      tSNE1,
+      tSNE2,
+      label = label_before,
+      panel = "Before (markers)"),
+  
+  df_plot %>%
+    transmute(
+      Protein.Group,
+      tSNE1,
+      tSNE2,
+      label = label_after,
+      panel = "After (TAGM ≥ 0.95)")) %>%
+  mutate(
+    panel = factor(
+      panel,
+      levels = c("Before (markers)", "After (TAGM ≥ 0.95)")))
+
+## ---------------------------
+## 7) Palette
+## ---------------------------
+plot_palette <- c(marker_palette, "unknown" = "grey85")
+
+## ---------------------------
+## 8) Plot
+## ---------------------------
+H8 <- ggplot(df_plot_long, aes(tSNE1, tSNE2)) +
+  
+  geom_point(
+    data = df_plot_long %>% filter(label == "unknown"),
+    aes(colour = label),
+    alpha = 0.1,
+    size = 1.5) +
+  
+  geom_point(
+    data = df_plot_long %>% filter(label != "unknown"),
+    aes(colour = label),
+    alpha = 0.5,
+    size = 2.5) +
+  
+  scale_colour_manual(values = plot_palette, drop = FALSE) +
+  
+  facet_wrap(~panel, scales = "fixed") +
+  
+  theme_classic(base_family = "Helvetica") +
+  
+  labs(
+    title = "",
+    subtitle = "",
+    x = "t-SNE 1",
+    y = "t-SNE 2",
+    colour = "Compartment") +
+  
+  theme(
+    legend.position = "none",
+
+    plot.title = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 10),
+
+    strip.text = element_text(face = "bold", size = 10),
+    strip.background = element_blank(),
+
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+```
+
+
+## Figure 6B: Subject-level cross-validation
+
+The model predicts TAGM allocations with allocated-class probability weights. Test folds contain up to five subjects at a time, and training uses up to 20 of the remaining subjects (19 for some control folds after G2 exclusion). Accuracy measures agreement with original TAGM-MAP output labels.
+
+```{r oos-model}
+# ============================================================
+# Model explanation
+# ============================================================
+# 1) A weighted multinomial GLM:
+#       compartment_class (k=11) ~ prop in fraction + covariates
+# where each row is weighted by TAGM confidence for that row (Subject-protein).
+#
+# 2) Subject-level CV with TRAIN=20 subjects, TEST=5 subjects (within each disease group), generating 
+# OUT-OF-SAMPLE predictions for everyone. 
+# This should capture inter-individual prediction stability and uncertainty in localisation prediction
+# ============================================================
+
+# -------------------- Packages ------------------------------
+library(data.table)   # fast grouping + joins for big data
+library(nnet)         # multinomial GLM via multinom()
+library(ggplot2)      # plotting
+library(ggridges)     # ridge plots
+
+# A) -------------------- Data prep -----------------------------
+#get sum normalised quant
+tagm_df_prop <- tagm_df %>% filter(!is.na(Group)) %>%
+  #remove curated marker assignments from training, where weight=1
+  filter(markers == "unknown") %>% 
+  relocate(prop, .after = Genes)
+
+dt <- data.table::as.data.table(tagm_df_prop)  # convert to data.table for speed / memory efficiency
+
+# Define outcome label y (the TAGM-MAP allocation is one of 11 class labels)
+dt[, y := factor(tagm.map.allocation)] 
+
+# Define variables  
+dt[, cond := factor(Group)]     # disease condition (adjust if your column is named differently)
+dt[, sex := factor(msex)]     # sex as factor (0/1 -> categorical)
+dt[, age := age_death]      # numeric
+dt[, post_m := pmi]       # numeric (rename to avoid confusion with the data.table 'pmi' symbol)
+dt[, frac := as.character(Fraction)] #fraction label
+dt[, prop := prop]     #numeric proportion of protein in fraction
+
+# ------------------------------------------------------------
+# B) Build weights: w = posterior probability of the allocated class from tagm prediction
+# ------------------------------------------------------------
+# Weighting reduces the impact of uncertain TAGM assignments on model training
+
+# extract compartment probability columns for weighting
+prob_cols <- intersect(names(dt), levels(dt$y))  
+
+# for each row, find the probability column corresponding to its assigned class, y
+idx <- match(as.character(dt$y), prob_cols) #idx is the column index in prob_cols for that row’s class.
+
+# pull out the per-row weight (posterior probability of the allocated class). cbind() builds the row/col coordinate to extract from the probability matrix.
+dt[, w := as.numeric(as.matrix(dt[, ..prob_cols])[cbind(.I, idx)])]
+
+# sanity checks:
+summary(dt$w)     # check distribution
+table(is.na(dt$w))  # ensure weights were successfully created
+
+#---------- pivot wide for proportional profiles per subject gene  ----------
+# so the model can use the complete fractionation profile to predict the compartment
+
+# Keep only what we need for profile + labels/covars
+base_cols <- c("Subject","Genes","cond","sex","age","post_m","y","w","frac","prop")
+dt0 <- dt[, ..base_cols]
+#Wide: one row per Subject x Gene with columns prop_1p...prop_7p
+dt_wide <- dcast(dt0, Subject + Genes + cond + sex + age + post_m + y + w 
+                 ~ frac, value.var = "prop", fill = 0)
+
+# name proportion in frac columns to prop_<fraction>
+frac_levels <- setdiff(names(dt_wide), c("Subject","Genes","cond","sex","age","post_m","y","w"))
+setnames(dt_wide, frac_levels, paste0("prop_", frac_levels))
+
+# ============================================================
+# C) Cross-validation: TRAIN 20 subjects, TEST 5 subjects, within each cond
+# ============================================================
+# We want OUT-OF-SAMPLE predictions:
+# each subject should appear in the TEST set at least once to get a held-out prediction.
+#
+# This is performed within disease group (cond)
+#
+# - For each disease group:
+#   - Partition subjects into splits of ~5 (these will be the TEST sets).
+#   - For each split:
+#       - TRAIN = sample 20 subjects from the remaining subjects in that disease group
+#         (if fewer than 20 are available, train on all remaining).
+#       - Fit model on TRAIN rows.
+#       - Predict probabilities on TEST rows (OUT-OF-SAMPLE).
+# - Store predictions and later filter to proteins of interest.
+# ============================================================
+
+set.seed(1)  #reproducible subject splits
+
+# Choose which groups to run (adjust levels if needed)
+groups_to_run <- levels(dt$cond) #"AD-DEM" "CON"  "RES"  
+
+# list to store out-of-sample probability predictions for all groups/folds
+oos_pred_list <- list()
+
+# list to store fold-level performance metrics (optional)
+perform_list <- list()
+
+# loop over disease groups (CON / AD-DEM / RES)
+for (g in groups_to_run) {
+
+  ### PERFORM SPLIT
+  dt_g <- dt_wide[cond == g] # subset to this disease group only
+  subj_g <- unique(dt_g$Subject) # extract subject list within this group
+  if (length(subj_g) < 6) next  #cannot hold out 5 if fewer than 6 subjects exist
+  subj_g <- sample(subj_g) # shuffle subjects so test chunks are random
+  test_chunks <- split(subj_g, ceiling(seq_along(subj_g) / 5)) # split into chunks of 5 test subjects
+
+  # Loop over each test chunk (each is one out-of-sample evaluation)
+  for (fold_i in seq_along(test_chunks)) {
+
+    test_subj <- test_chunks[[fold_i]]             #TEST = 5 subjects 
+    remaining <- setdiff(subj_g, test_subj)      # subjects available for training
+
+    # TRAIN = sample 20 subjects from remaining if possible, else use all remaining
+    train_subj <- if (length(remaining) >= 20) sample(remaining, 20) else remaining
+
+    # Create training and test row sets (row-level data, split by Subject)
+    train_dt <- dt_g[Subject %in% train_subj]
+    test_dt  <- dt_g[Subject %in% test_subj]
+
+    ### Build weighted multinomial GLM on training rows
+    #This learns how compartment depends on fractionation profile and covars, weighted by TAGM posteror
+    # compartment ~ proportion in fractions 1-7, sex, age, and post-mortem interval
+
+    prop_feature_cols <- grep("^prop_", names(dt_g), value = TRUE) #fractionation profile
+    
+    formula <- as.formula(paste(
+      "y ~", paste(c(prop_feature_cols, "sex", "age", "post_m"), collapse = " + ")))
+    
+    ### FIT MODEL 
+    fit <- multinom(formula, data = train_dt, weights = w, maxit = 200, trace = FALSE)
+
+    ### Evaluate out-of-sample classification on the test set (accuracy)
+    pred_class <- predict(fit, newdata = test_dt, type = "class")
+    # accuracy is weighted by TAGM confidence (matching a higher confidence assigment contributes more)
+    acc_w <- with(test_dt, weighted.mean(pred_class == y, w, na.rm = TRUE))
+
+    perform_list[[length(perform_list) + 1]] <- data.table(
+      cond = g,
+      fold = fold_i,
+      n_train_subjects = length(train_subj),
+      n_test_subjects  = length(test_subj),
+      n_train_rows = nrow(train_dt),
+      n_test_rows  = nrow(test_dt),
+      acc_w = acc_w)
+
+    # Get out-of-sample predicted probabilities for each test row
+    # This is what is used to build probability distributions per protein.
+    pr <- predict(fit, newdata = test_dt, type = "probs")   #matrix: n_test_rows × k_classes
+
+    pr_dt <- as.data.table(pr)                              # convert probs to data.table
+
+    # Attach identifiers so this can be aggregated later
+    pr_dt[, `:=`(
+      cond    = g,                     # disease group
+      fold    = fold_i,                # which test chunk
+      Subject = test_dt$Subject,        # subject id for each row
+      Genes   = test_dt$Genes,          # gene for each row
+      row_w   = test_dt$w               # TAGM confidence weight for the row (optional for aggregation)
+    )]
+
+    # Store out-of-sample predictions
+    oos_pred_list[[length(oos_pred_list) + 1]] <- pr_dt
+  }
+}
+
+### STORE all out-of-sample predictions into one table
+oos_pred <- rbindlist(oos_pred_list, fill = TRUE)
+unique(oos_pred$Genes)
+
+
+# Combine performance metrics (to assess accuracy)
+performance <- rbindlist(perform_list, fill = TRUE)
+range(performance$acc_w)
+
+# Inspect
+performance[, .(mean_acc_w = mean(acc_w, na.rm = TRUE)), by = cond]
+performance[, .(mean_acc = mean(acc_w), sd_acc = sd(acc_w)), by = cond]
+
+```
+
+## Figure 6B: Plot held-out accuracy
+
+Only the observed fold-accuracy points are implemented in the supplied source. The lower reference/permutation points and schematic visible in the manuscript need their separate source.
+
+```{r oos-accuracy}
+
+means <- performance %>%
+  group_by(cond) %>%
+  summarise(mean_acc = mean(acc_w),
+    SD = sd(acc_w), .groups = "drop")
+means$x <- c(1, 2, 3)
+
+accuracy <- ggplot(
+  performance,
+  aes(x = factor(cond, levels = c("CON", "RES", "AD-DEM")),
+    y = acc_w, fill = cond, colour = cond)) +
+
+  ## individual folds
+  geom_point(
+    shape = 21,
+    colour = "black",
+    aes(fill = cond),
+    size = 3,
+    stroke = 0.45,
+    alpha = 0.7,
+    position = position_jitter(width = 0.03, height = 0)) +
+
+  scale_fill_manual(values = condition_palette) +
+  scale_colour_manual(values = condition_palette) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    expand = expansion(mult = c(0, 0.02))) +
+
+  labs(x = NULL, y = "Weighted accuracy") +
+
+  theme_classic( base_family = "Helvetica", base_size = 10) +
+
+  theme(legend.position = "none",
+    axis.text.x = element_text(face = "bold", size = 10),
+    axis.text.y = element_text(size = 10 ),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold",size = 10),
+    plot.subtitle = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+```
+
+
+## Save local held-out predictions
+
+- Included in manuscript supplementary
+
+```{r save-oos}
+write_csv("oos_predictions.csv")
+```
+
+
+## Prepare probability and logit summaries
+
+
+```{r oos-long}
+
+## Pivot to long
+oos_long <- oos_pred %>%
+  pivot_longer(cols = all_of(comp_cols), names_to = "compartment", values_to = "oos_prob") %>%
+  mutate(logit_oos_prob = qlogis(pmin(pmax(oos_prob, 1e-6), 1 - 1e-6)))
+```
+
+
+## Figure 6C: Compartment counts (n confident) and median probabilities
+
+```{r compartment-summaries}
+library(ggrepel)
+
+## ----------------------------------------
+## Mean OOS probability per Gene
+## ----------------------------------------
+plot_df <- oos_long %>%
+  group_by(compartment, Genes) %>%
+  summarise(median_oos_prob = median(oos_prob, na.rm = TRUE), .groups = "drop") %>%
+  mutate(compartment = factor(compartment, levels = names(marker_palette)))
+
+# darker marker palette
+library(colorspace)
+marker_palette_dark <- darken(marker_palette, amount = 0.35)
+
+## ----------------------------------------
+## Label Top 5 genes per compartment
+## ----------------------------------------
+label_df <- plot_df %>%
+  group_by(compartment) %>%
+  slice_max(median_oos_prob,
+            n = 5,
+            with_ties = FALSE) %>% ungroup()
+
+## ----------------------------------------
+## Violin plot
+## ----------------------------------------
+violin <- ggplot(plot_df,
+                 aes(x = compartment, y = median_oos_prob,
+                     fill = compartment, colour = compartment)) +
+
+  geom_violin(
+    alpha = 0.35,
+    linewidth = 0.4,
+    trim = TRUE,
+    scale = "width") +
+
+  geom_boxplot(
+    width = 0.12,
+    outlier.shape = NA,
+    alpha = 0.8,
+    linewidth = 0.35,
+    colour = "black") +
+
+  geom_point(
+  data = label_df,
+  aes(fill = compartment),
+  shape = 21,
+  colour = "black",
+  stroke = 0.3,
+  size = 2.5,
+  alpha = 0.8) +
+
+  geom_text_repel(
+  data = label_df,
+  aes(label = Genes, colour = compartment),
+  size = 3,
+  fontface = "bold.italic",
+  box.padding = 0.3,
+  point.padding = 0.2,
+  segment.size = 0.25,
+  segment.alpha = 0.6,
+  max.overlaps = Inf,
+  show.legend = FALSE) +
+
+  scale_fill_manual(values = marker_palette) +
+  scale_colour_manual(values = marker_palette_dark, guide = "none") +
+
+  coord_cartesian(ylim = c(0, 1)) +
+
+  labs(x = NULL, y = "Median OOS p") +
+
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(face = "bold", size = 10),
+    plot.title = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+    panel.grid.major.x = element_blank())
+
+violin
+
+# ----- bar chart 
+high_conf_counts <- oos_long %>%
+  filter(oos_prob > 0.95) %>%
+  distinct(compartment, Genes) %>%
+  dplyr::count(compartment, name = "n_proteins") %>%
+  complete(
+    compartment = names(marker_palette),
+    fill = list(n_proteins = 0)) %>%
+  mutate(compartment = factor(compartment,
+      levels = names(marker_palette))) %>% filter(compartment !="Unknown")
+
+bar <- ggplot(high_conf_counts,
+              aes(x = compartment,
+                  y = n_proteins,
+                  fill = compartment)) +
+
+  geom_col(width = 0.7, linewidth = 0.3, alpha = 0.85) +
+
+  geom_text(aes(label = n_proteins),
+    vjust = -0.4, fontface = "bold", size = 3) +
+
+  scale_fill_manual(values = marker_palette) +
+
+  expand_limits(y = max(high_conf_counts$n_proteins) * 1.08) +
+
+  labs(x = NULL, y = "N, OOS p>0.95") +
+
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(
+  axis.title.x = element_blank(),
+  axis.text.x = element_blank(),
+  axis.ticks.x = element_blank(),
+  axis.title.y = element_text(face = "bold", size = 10),
+  axis.text.y = element_text(size = 10),
+  legend.position = "none",
+  legend.title = element_text(size = 10),
+  legend.text = element_text(size = 10),
+  plot.title = element_text(face = "bold", size = 10),
+  plot.subtitle = element_text(size = 10),
+  panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3),
+  panel.grid.major.x = element_blank())
+```
+
+
+## Figure 6D: SNRPA and SCAI probability distributions
+
+
+```{r snrpa-scai-probabilities}
+library(dplyr)
+library(ggplot2)
+library(ggridges)
+library(patchwork)
+
+# -----------------------------
+# 1) Prepare data
+# -----------------------------
+SNRPA_filt <- oos_long %>% 
+  filter(Genes == "SNRPA",
+    compartment %in% c("Nucleus", "Ribosome", "Cytosol")) %>%
+  mutate(cond = factor(cond, levels = c("AD-DEM", "RES", "CON")))
+
+SCAI_filt <- oos_long %>% 
+  filter(Genes == "SCAI",
+    compartment %in% c("Presynapse", "Postsynapse","Cytosol")) %>%
+  mutate(cond = factor(cond, levels = c("AD-DEM", "RES", "CON")))
+
+
+#shared x-axis limits
+x_lims <- range(c(SNRPA_filt$oos_prob, SCAI_filt$oos_prob, CTHRC1_filt$oos_prob),na.rm = TRUE)
+
+SNRPA <- ggplot(
+  SNRPA_filt,
+  aes(x = oos_prob, y = cond,
+    fill = compartment)) +
+
+  geom_density_ridges(
+    alpha = 0.6,
+    scale = 0.55,
+    rel_min_height = 0.001,
+    colour = "grey30") +
+
+  geom_point(
+    aes(x = oos_prob),
+    position = position_jitter(height = 0.01),
+    size = 3,
+    alpha = 0.35,
+    shape = 21,
+    colour = "black",
+    stroke = 0.2) +
+
+  # facet by compartment, with no custom coloured strips
+  ggh4x::facet_wrap2(~ compartment, ncol = 3) +
+
+  scale_x_continuous(
+    limits = x_lims,
+    labels = scales::label_number(accuracy = 0.1)) +
+
+  scale_fill_manual(
+    values = marker_palette, name = "Compartment") +
+
+  labs(title = "SNRPA",
+    x = "OOS posterior probability",  y = "Condition") +
+
+  theme_classic(
+    base_family = "Helvetica",
+    base_size = 10) +
+
+  theme(legend.position = "none",
+
+    #Plain compartment titles — no strip box
+    strip.background = element_blank(),
+    strip.text = element_text(
+      colour = "black",
+      size = 10,
+      face = "bold"),
+
+    plot.title = element_text(
+      size = 10,
+      face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+
+##---------------- SCAI ----------------------
+
+SCAI <- ggplot(
+  SCAI_filt,
+  aes(x = oos_prob, y = cond,
+    fill = compartment)) +
+
+  geom_density_ridges(
+    alpha = 0.6,
+    scale = 0.55,
+    rel_min_height = 0.001,
+    colour = "grey30") +
+
+  geom_point(
+    aes(x = oos_prob),
+    position = position_jitter(height = 0.01),
+    size = 3,
+    alpha = 0.35,
+    shape = 21,
+    colour = "black",
+    stroke = 0.2) +
+
+  ggh4x::facet_wrap2( ~ compartment, ncol = 4) +
+
+  scale_x_continuous(
+    limits = x_lims,
+    labels = scales::label_number(accuracy = 0.1)) +
+  scale_fill_manual( values = marker_palette, name = "Compartment") +
+
+  labs(title = "SCAI",
+    x = "OOS posterior probability",
+    y = "Condition") +
+
+  theme_classic(
+    base_family = "Helvetica",
+    base_size = 10) +
+
+  theme(legend.position = "none",
+
+    # Plain facet titles (no strip background)
+    strip.background = element_blank(),
+    strip.text = element_text(
+      colour = "black",
+      size = 10,
+      face = "bold" ),
+
+    plot.title = element_text(
+      size = 10,
+      face = "bold"),
+
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+
+
+SNRPA / SCAI
+```
+
+
+## Supplementary Figure S5: GO:CC ranked enrichment
+
+mean-probability rankings, pathway sizes 100–300, positive enrichment and nPermSimple=10000. Seed =3
+
+```{r oos-ranked-enrichment}
+
+#create ranked table (rank proteins within compartment by mean oos prob)
+rank_table <- oos_long %>%
+  group_by(compartment, Genes) %>%
+  summarise(n_subjects = n(),
+    mean_prob = mean(oos_prob, na.rm = TRUE), .groups = "drop") %>%
+  left_join(rowmeta, by = "Genes")
+
+#build ranked vectors
+ranks_by_compartment <- rank_table %>%
+  group_by(compartment) %>%
+  summarise(ranks = list(sort(setNames(mean_prob, Genes), decreasing = TRUE)),
+    .groups = "drop")
+
+## extract GO pathways
+go_cc_pathways <- msigdbr(
+  species = "Homo sapiens", category = "C5", subcategory = "GO:CC") %>%
+  dplyr::select(gs_name, gene_symbol) %>% distinct() %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(unique(gene_symbol)), .groups="drop") %>%
+  tibble::deframe()
+
+# restrict to genes in each ranking
+filter_pathways_to_universe <- function(pathways, universe){
+  pathways2 <- lapply(pathways, intersect, y = universe)
+  pathways2[lengths(pathways2) >= 100]
+
+}
+
+# Run FGSEA
+set.seed(3)
+ranks_by_compartment <- ranks_by_compartment %>%
+  rowwise() %>%
+  mutate(pathways = list(
+      filter_pathways_to_universe(
+        go_cc_pathways, names(ranks))),
+    fgsea = list(
+      fgsea(pathways = pathways,
+        stats = ranks,
+        scoreType = "pos",
+        minSize = 100,
+        maxSize = 300,
+        nPermSimple = 10000))) %>% ungroup()
+
+fgsea_tidy <- ranks_by_compartment %>%
+  dplyr::select(compartment, fgsea) %>%
+  tidyr::unnest(fgsea) %>%
+  filter(NES > 0, padj < 0.05, !is.na(log2err)) %>% arrange(desc(NES)) 
+
+fgsea_tidy %>% group_by(compartment) %>% arrange(desc(size))
+
+fgsea_top2 <- fgsea_tidy %>%
+  group_by(pathway) %>%
+  slice_max(NES, n = 2, with_ties = FALSE) %>%
+  ungroup() %>% arrange(compartment, desc(size))
+```
+
+
+## Supplementary Figure S5: Enrichment plot
+
+```{r ranked-enrichment-plot}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+
+## -----------------------------
+## Clean pathway names
+## -----------------------------
+plot_df <- fgsea_tidy %>%
+  filter(!is.na(log2err)) %>%
+  mutate(
+    pathway = str_remove(pathway, "^GOCC_"),
+    pathway = str_replace_all(pathway, "_", " "),
+    pathway = str_replace_all(pathway, regex("\\btransferase\\b", ignore_case = TRUE), ""),
+    pathway = str_replace_all(pathway, regex("\\bcontaining\\b", ignore_case = TRUE), ""),
+    pathway = str_replace_all(pathway, regex("\\bprotein\\b", ignore_case = TRUE), ""),
+    pathway = str_replace_all(pathway, "\\s{2,}", " "),   # remove double spaces
+    pathway = str_trim(pathway),
+    pathway = str_to_title(pathway),
+    pathway = str_wrap(pathway, width = 70))
+
+## -----------------------------
+## Order compartments
+## -----------------------------
+plot_df$compartment <- factor(
+  plot_df$compartment, levels = names(marker_palette))
+
+## -----------------------------
+## Order pathways by maximum NES
+## -----------------------------
+plot_df$pathway <- fct_reorder(
+  plot_df$pathway, plot_df$NES, .fun = max)
+
+## -----------------------------
+## Bubble plot
+## -----------------------------
+bubble <- ggplot(plot_df, aes(x = compartment, y = pathway)) +
+  geom_point(aes(size = size, colour = NES), alpha = 0.6) +
+  scale_x_discrete(position = "top") +
+  scale_size_continuous(name = "Size", range = c(3,10)) +
+
+  scale_colour_viridis_c(
+    option = "D",
+    name = "NES") +
+
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 13) +
+  theme(axis.text.x = element_text(
+      angle = 45,  hjust = 0, vjust = 0, face = "bold"),
+    axis.text.y = element_text(face = "italic"),
+    legend.position = "right",
+    panel.grid.major.y = element_line(
+      colour = "grey92",
+      linewidth = 0.3),
+    panel.grid.major.x = element_blank())
+bubble 
+
+##Table below also included in supplementary data
+#write_csv(plot_df %>% dplyr::select(-leadingEdge), output_file("fgsea_OOS.csv"))
+```
+
+
+## Figure 6E: Jensen–Shannon divergence
+
+```{r js-divergence}
+###----------- DIVERGENCE -----------------
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(tidytext)
+
+###----------------------------
+### Mean localisation profile
+###----------------------------
+
+mean_prob <- oos_long %>%
+  group_by(cond, Genes, compartment) %>%
+  summarise(mean_prob = mean(oos_prob, na.rm = TRUE),
+    .groups = "drop") %>%
+  pivot_wider(
+    names_from = compartment,
+    values_from = mean_prob,
+    values_fill = 0)
+
+feat_cols <- setdiff(names(mean_prob), c("Genes","cond"))
+
+###------------------------------
+### Jensen-Shannon divergence calculation
+###-----------------------------
+
+jsd_vec <- function(p, q, eps = 1e-12){ #add a small epsilon value to ensure non-zero
+
+  p <- (p + eps) / sum(p)
+  q <- (q + eps) / sum(q)
+
+  m <- (p + q)/2
+
+  0.5 * sum(p * log(p / m)) +
+  0.5 * sum(q * log(q / m))
+}
+
+###------------------------------
+### Function for one comparison
+###------------------------------
+
+calc_jsd <- function(df, cond1, cond2){
+
+  p1 <- df %>% filter(cond == cond1)
+  p2 <- df %>% filter(cond == cond2)
+
+  merged <- inner_join(p1, p2, by = "Genes", suffix = c("_1","_2"))
+  
+  cols1 <- paste0(feat_cols, "_1")
+  cols2 <- paste0(feat_cols, "_2")
+
+  merged$JSD <- mapply(
+    function(i){ 
+      jsd_vec( #applies JSD calclation to columns
+        as.numeric(merged[i, cols1]),
+        as.numeric(merged[i, cols2]))
+    },
+    seq_len(nrow(merged)))
+
+   merged %>%
+    transmute(Genes,
+      contrast = paste(cond1, "vs", cond2), JSD)
+
+}
+
+###----------------------------
+### Run all three contrasts and view
+###----------------------------
+
+js_long <- bind_rows(
+  calc_jsd(mean_prob, "AD-DEM", "CON"),
+  calc_jsd(mean_prob, "AD-DEM", "RES"),
+  calc_jsd(mean_prob, "CON", "RES"))
+
+js_long %>% arrange(desc(JSD))
+
+#This can be found in supplementary
+#write_csv(js_long, "JSD.csv")
+```
+
+## Read in external bulk-proteomics statistics from Johnson et al., 2022
+
+
+```{r external-bulk-input}
+library(readxl)
+library(dplyr)
+library(tidyr)
+
+raw <- read_excel("Johnson_2022.xlsx", col_names = FALSE)
+glimpse(raw)
+
+df <- raw[-c(1, 2), ] #clean df (remove header rows first)
+colnames(raw)[510]  #this is the ANOVA P-Value column
+colnames(df) <- raw[2, ] #assign temporary names for filtering
+
+# filter significant proteins
+df_sig <- df %>%
+  mutate(ANOVA_P_Value = as.numeric(ANOVA_P_Value)) %>% filter(ANOVA_P_Value < 0.05)
+
+sample_cols <- which(raw[1, ] %in% c("AD", "AsymAD", "Control"))
+cond_vec <- as.character(unlist(raw[1, sample_cols]))
+colnames(df_sig)[sample_cols] <- paste(
+  cond_vec,
+  colnames(df_sig)[sample_cols],
+  sep = "_")
+
+df_long <- df_sig %>%
+  pivot_longer(cols = all_of(sample_cols),
+    names_to = "sample_id",
+    values_to = "value") %>%
+  separate(sample_id, into = c("cond", "sample"), sep = "_") %>%
+  mutate(value = as.numeric(value)) %>% distinct() %>%
+  mutate(Holm_Adj_P_Value_AD_CON = as.numeric(Holm_Adj_P_Value_AD_CON))
+
+# Extract all necessary cols (for AD vs CON contrast)
+sig_AD_con <- df_long %>% filter(Holm_Adj_P_Value_AD_CON < 0.05) %>% 
+  dplyr::select(Symbol, `Uniprot Accession`, `AD-Control`, Holm_Adj_P_Value_AD_CON) %>% distinct() %>% 
+  mutate(`AD-Control` = as.numeric(`AD-Control`))
+
+glimpse(sig_AD_con)
+```
+
+
+## Figure 6Eii: Divergence and external abundance
+
+```{r divergence-vs-abundance}
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+text_theme <- theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    plot.title = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+
+##---------------------------------------
+## Join JSD with external abundance
+##---------------------------------------
+
+plot_df2 <- js_long %>%
+  filter(contrast == "AD-DEM vs CON") %>%
+  mutate(Genes = sub("___.*$", "", Genes)) %>%
+  left_join(
+    sig_AD_con %>%
+      dplyr::rename(Genes = Symbol) %>%
+      distinct(Genes,
+        `AD-Control`, Holm_Adj_P_Value_AD_CON),
+    by = "Genes")
+
+##---------------------------------------
+## Top 15 highest JSD proteins
+##---------------------------------------
+
+top_15_js <- plot_df2 %>%
+  filter(!is.na(`AD-Control`)) %>%
+  slice_max(
+    order_by = JSD,
+    n = 15,
+    with_ties = FALSE) %>%
+  mutate(
+    Genes = fct_reorder(Genes, JSD))
+
+##---------------------------------------
+## Plot
+##---------------------------------------
+
+fc_lim <- range(plot_df2$`AD-Control`, na.rm = TRUE)
+
+divergence_fc <- ggplot(top_15_js, aes(x = JSD, y = Genes)) +
+
+  geom_segment(
+    aes(x = 0, xend = JSD, yend = Genes),
+    colour = "grey80",
+    linewidth = 0.7) +
+
+  geom_point(
+    aes(fill = `AD-Control`),
+    shape = 21,
+    size = 4.5,
+    colour = "black",
+    stroke = 0.4) +
+
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "#F7F7F7",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = fc_lim,
+    breaks = c(fc_lim[1], 0, fc_lim[2]),
+    labels = scales::number(
+      c(fc_lim[1], 0, fc_lim[2]),
+      accuracy = 0.1),
+    na.value = "grey75",
+    name = "log₂ FC\n      ",
+    guide = guide_colourbar(
+      title.position = "top",
+      direction = "vertical",
+  barheight = unit(3, "cm"),
+  barwidth = unit(0.5, "cm") )) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+
+  labs(
+    x = "JS divergence",
+    y = NULL) +
+
+  text_theme +
+
+  theme(
+  legend.position = c(0.5, 0.65),
+  legend.justification = c(0, 1),
+  legend.direction = "vertical",
+  legend.background = element_blank(),
+  legend.key.height = unit(1.8, "cm"),
+  legend.key.width = unit(0.35, "cm"),
+    axis.text.y = element_text(face = "italic", size = 10),
+    axis.title.x = element_text(size = 10))
+```
+
+
+## Figure 6Ei: External bulk-proteomics volcano
+
+
+```{r bulk-volcano}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+summary_stats <- df_long %>% dplyr::select(Symbol, `Uniprot Accession`, ANOVA_F_Value, ANOVA_P_Value,
+                                    Holm_Adj_P_Value_AD_CON,
+                                    Holm_Adj_P_Value_Asym_CON, 
+                                    Holm_Adj_P_Value_AD_Asym,
+                                    `AD-Control`, `AsymAD-Control`, `AD-AsymAD`) %>% 
+  dplyr::rename(Genes = Symbol, Protein.Group = `Uniprot Accession`) %>% distinct()
+
+
+volcano_df <- summary_stats %>%
+  mutate(
+    log2FC = as.numeric(`AD-Control`),
+    p_adj = as.numeric(Holm_Adj_P_Value_AD_CON),
+    neg_log10_p = -log10(p_adj),
+    highlight = Genes %in% c("CTHRC1", "MDK", "SMOC1")) %>% 
+  filter(!is.na(log2FC), !is.na(p_adj), p_adj > 0)
+
+volc <- ggplot(volcano_df, aes(x = log2FC, y = neg_log10_p)) +
+  geom_point(data = filter(volcano_df, !highlight), colour = "grey80", alpha = 0.5, size = 1.4) +
+  geom_point(data = filter(volcano_df, highlight),
+    colour = "red", alpha = 0.9, size = 2.2) +
+  geom_hline(yintercept = -log10(0.05),
+    linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+  geom_text_repel(
+  data = filter(volcano_df, highlight),
+  aes(label = Genes),
+  size = 3.8,
+  fontface = "italic",
+  max.overlaps = Inf,
+  point.padding = 0.8,
+  box.padding = 0.6,
+  force = 2,
+  segment.color = NA) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(
+    x = expression(log[2]~fold~change~"(AD - Control)"),
+    y = expression(-log[10]~adjusted~p-value)) +
+  theme_classic(base_family = "Helvetica", base_size = 10) +
+  theme(
+    axis.text.y = element_text(face = "italic", size = 10),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(face = "bold", size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+volc
+```
+
+
+## Figure 6Eiii: Disease-group profiles in PCA space
+
+
+```{r condition-pca}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(QFeatures)
+library(ggplot2)
+library(ggrepel)
+
+
+## ---- 1) Marker prep ----
+selected_set_clean <- tagm_df %>% filter(markers != "unknown") %>%
+  dplyr::select(markers, Protein.Group) %>% distinct() 
+
+plot_palette <- c(marker_palette, "unknown" = "grey80")
+
+## ---- 2) Metadata ----
+cd2 <- cd %>%
+  dplyr::select(RunID, Subject, Fraction) %>%
+  left_join(prop %>% dplyr::select(Subject, Group) %>% distinct(), by = "Subject") %>%
+  dplyr::rename(cond = Group)
+
+## ---- 3) Mean profiles WITH condition ----
+mean_profile_cond <- MAI_raw %>%
+  dplyr::rename(RunID = "SampleID", Protein.Group = "feature_id", Quant = "value") %>%
+  left_join(cd2, by = "RunID") %>%
+  filter(cond %in% c("AD-DEM", "CON")) %>%
+  group_by(Protein.Group, Fraction, cond) %>%
+  summarise(mean_Quant = mean(Quant, na.rm = TRUE), .groups = "drop") %>%
+  unite("Protein_cond", Protein.Group, cond) %>%
+  pivot_wider(names_from = Fraction, values_from = mean_Quant) %>%
+  mutate(across(-Protein_cond, as.numeric)) %>%
+  column_to_rownames("Protein_cond")
+
+## ---- 4) QFeatures + sum normalisation ----
+qf_mean <- readQFeatures(
+  mean_profile_cond %>% rownames_to_column("Protein_cond"),
+  quantCols = 2:ncol(mean_profile_cond %>% rownames_to_column("Protein_cond")),
+  name = "mean_profile")
+
+qf_mean <- normalize(
+  qf_mean,
+  i = "mean_profile",
+  name = "norm_profile",
+  method = "sum")
+
+## ---- 5) PCA ----
+se <- qf_mean[["norm_profile"]]
+mat <- assay(se)
+#restore Protein_cond as rownames
+rownames(mat) <- rowData(se)$Protein_cond
+
+pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+pct <- summary(pca)$importance[2, ] * 100
+
+## ---- 6) Extract PCA coords ----
+df_pca <- as.data.frame(pca$x[, 1:3]) %>%
+  setNames(c("PC1", "PC2", "PC3")) %>%
+  rownames_to_column("Protein_cond") %>%
+  separate(Protein_cond, into = c("Protein.Group", "cond"), sep = "_") %>%
+  left_join(selected_set_clean, by = "Protein.Group") %>%
+  mutate(cond = factor(cond, levels = c("CON", "AD-DEM")),
+    markers = ifelse(is.na(markers), "unknown", as.character(markers)),
+    markers = factor(markers, levels = c(names(marker_palette), "unknown")))
+
+## ---- 7) Add protein/gene names (for external overlay) ----
+df_pca <- df_pca %>%
+  left_join(summary_stats %>% dplyr::select(Genes, Protein.Group), by = "Protein.Group")
+
+highlight_genes <- c("CTHRC1", "MDK", "SMOC1") 
+
+df_arrows <- df_pca %>%
+  filter(Genes %in% highlight_genes) %>%  
+  dplyr::select(Protein.Group, Genes, cond, PC1, PC2) %>%
+  pivot_wider(names_from = cond, values_from = c(PC1, PC2)) %>%
+  mutate(curvature = ifelse(Genes == "MDK", -0.2, 0.1))
+
+## ---- 8) Plot ----
+p_pca <- ggplot(df_pca, aes(x = PC1, y = PC2)) +
+  
+  #density background
+  stat_density_2d(data = df_pca %>% filter(markers == "unknown"),
+    geom = "polygon", fill = "grey70",
+    colour = NA, alpha = 0.02, bins = 8) +
+  
+  # background proteins
+  geom_point(data = df_pca %>% filter(markers == "unknown"),
+    aes(colour = markers), alpha = 0.02, size = 4) +
+  
+  #marker proteins
+  geom_point(data = df_pca %>% filter(markers != "unknown"),
+    aes(fill = markers),
+    shape = 21, colour = "grey20", stroke = 0.18, alpha = 0.1, size = 4) +
+  
+  #proteins of interest
+  geom_point(data = df_pca %>% filter(Genes %in% highlight_genes),
+    shape = 18, colour = "black", alpha = 0.7, size = 3.5) +
+  
+  #Gene labels
+  #geom_text_repel(data = df_pca %>% filter(Genes %in% highlight_genes),
+    #aes(markers = Genes), seed = 30, size = 1.5, 
+    #fontface = "bold", colour = "black", max.overlaps = Inf) +
+
+  #Non-MDK arrows
+  geom_curve(
+  data = df_arrows %>% filter(Genes != "MDK") %>% mutate(cond = "CON"),
+  aes(x = PC1_CON,
+    y = PC2_CON,
+    xend = `PC1_AD-DEM`,
+    yend = `PC2_AD-DEM`),
+  curvature = 0.15,
+  arrow = arrow(length = unit(0.2, "cm")),
+  colour = "black",
+  linewidth = 0.6,
+  alpha = 0.7,
+  inherit.aes = FALSE) +
+
+  #MDK arrow (flipped)
+  geom_curve(
+  data = df_arrows %>% filter(Genes == "MDK") %>% mutate(cond = "CON"),
+  aes(x = PC1_CON,
+      y = PC2_CON,
+    xend = `PC1_AD-DEM`,
+    yend = `PC2_AD-DEM`),
+  curvature = -0.2,   #stronger flip helps visually
+  arrow = arrow(length = unit(0.2, "cm")),
+  colour = "black",
+  linewidth = 0.7,
+  alpha = 0.9,
+  inherit.aes = FALSE) +
+  
+  scale_colour_manual(values = plot_palette, drop = FALSE) +
+  scale_fill_manual(values = plot_palette, drop = FALSE) +
+  
+  facet_wrap(~factor(cond, levels = c("CON", "AD-DEM")), ncol = 2)  +
+  theme_classic(base_size = 10, base_family = "Helvetica") +
+  labs(x = paste0("PC1 (", round(pct[1], 1), "%)"),
+    y = paste0("PC2 (", round(pct[2], 1), "%)")) +
+  theme(strip.background = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 10),
+    plot.subtitle = element_text(size = 10),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+
+p_pca
+```
+
+
+## Figure 6F: Common cohort PCA space
+
+This panel derives mean subject-normalised profiles across the whole cohort (not within disease)
+
+```{r cohort-pca}
+mean_profile <- MAI_raw %>%
+  dplyr::rename(RunID = "SampleID", Protein.Group = "feature_id", Quant = "value") %>%
+  left_join(cd2, by = "RunID") %>%
+  
+  #normalisation
+  group_by(Subject, Protein.Group) %>%
+  mutate(prop = Quant / sum(Quant, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  #average across ALL cohort (no disease group split)
+  group_by(Protein.Group, Fraction) %>%
+  summarise(mean_prop = mean(prop, na.rm = TRUE), .groups = "drop") %>%
+  
+  pivot_wider(names_from = Fraction, values_from = mean_prop) %>%
+  mutate(across(-Protein.Group, as.numeric)) %>%
+  column_to_rownames("Protein.Group")
+
+mat <- scale(mean_profile)
+pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+pct <- summary(pca)$importance[2, ] * 100
+
+df_pca <- as.data.frame(pca$x[, 1:3]) %>%
+  setNames(c("PC1", "PC2", "PC3")) %>%
+  rownames_to_column("Protein.Group") %>%
+  left_join(selected_set_clean, by = "Protein.Group") %>%
+  mutate(
+    markers = ifelse(is.na(markers), "unknown", as.character(markers)),
+    markers = factor(markers, levels = c(names(marker_palette), "unknown")) )
+
+### PCA space
+df_pca
+```
+
+
+## Figure 6F: external-abundance overlays
+
+```{r spatial-density-preparation}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+##----------------------------------------------------------
+## 1. Intersect datasets
+##----------------------------------------------------------
+
+external_spatial <- sig_AD_con %>%
+  filter(`Uniprot Accession` %in% df_pca$Protein.Group) %>%
+  mutate(significance = if_else(
+      Holm_Adj_P_Value_AD_CON < 0.05, "Significant", "Background"),
+    direction = case_when(
+      # define external sigificant LogFC instances
+      Holm_Adj_P_Value_AD_CON < 0.05 & `AD-Control` > 0 ~ "Increased in AD",
+      Holm_Adj_P_Value_AD_CON < 0.05 & `AD-Control` < 0 ~ "Decreased in AD", 
+      TRUE ~ NA_character_)) %>%
+  dplyr::select(`Uniprot Accession`, significance, direction, `AD-Control`, Holm_Adj_P_Value_AD_CON)
+
+##----------------------------------------------------------
+## 2. Add external annotations to PCA dataframe
+##----------------------------------------------------------
+
+df_pca_plot <- df_pca %>%
+  left_join(external_spatial, by = c("Protein.Group" = "Uniprot Accession")) %>%
+  mutate(significance = replace_na(significance, "Background"))
+
+##----------------------------------------------------------
+## 3. Base PCA plot (common to all panels)
+##----------------------------------------------------------
+
+base_pca <- ggplot(df_pca_plot,
+                   aes(PC1, PC2)) +
+  ## faint full spatial proteome
+  geom_point(colour = "grey90", alpha = 0.05, size = 1) +
+  ## compartment markers
+  geom_point(data = df_pca_plot %>% filter(markers != "unknown"),
+    aes(colour = markers), alpha = 0.15, size = 4) +
+  scale_colour_manual(values = plot_palette, drop = FALSE) +
+  theme_classic(base_family = "Helvetica") +
+  theme(legend.position = "none") +
+
+  labs(x = paste0("PC1 (", round(pct[1],1), "%)"),
+       y = paste0("PC2 (", round(pct[2],1), "%)"))
+```
+
+
+## Figure 6F: Background and abundance-direction contours
+
+
+```{r spatial-density-panels}
+##----------------------------------------------------------
+## Panel A
+##----------------------------------------------------------
+
+p_background <-
+  base_pca +
+
+  stat_density_2d(
+    data = df_pca_plot %>% filter(significance == "Background"),
+    geom = "contour",
+    bins = 6,
+    colour = "black",
+    alpha = 0.6,
+    linewidth = 0.8) +
+ scale_x_continuous(expand = expansion(mult = c(0.02, 0.1))) +
+  theme(
+    plot.title = element_text(size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+
+
+## ------- grey PCA --------
+grey_pca <- ggplot(df_pca_plot, aes(PC1, PC2)) +
+
+  geom_point(
+    colour = "grey90",
+    alpha = 0.1,
+    size = 4) +
+
+  theme_classic(
+    base_family = "Helvetica",
+    base_size = 10) +
+
+  labs(
+    x = paste0("PC1 (", round(pct[1], 1), "%)"),
+    y = paste0("PC2 (", round(pct[2], 1), "%)")) +
+
+  theme(legend.position = "none",
+    plot.title = element_text(size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 10))
+
+
+##----------------------------------------------------------
+## Panel B
+##----------------------------------------------------------
+
+p_direction <-
+  grey_pca +
+
+  stat_density_2d(
+    data = df_pca_plot %>% filter(direction == "Increased in AD"),
+    geom = "contour",
+    bins = 6,
+    colour = "#B2182B",
+    linewidth = 0.9,
+    alpha = 0.7) +
+
+  stat_density_2d(
+    data = df_pca_plot %>% filter(direction == "Decreased in AD"),
+    geom = "contour",
+    bins = 6,
+    colour = "#2166AC",
+    linewidth = 0.9,
+    alpha = 0.7) +
+  
+ scale_x_continuous(expand = expansion(mult = c(0.02, 0.1))) +
+  theme(plot.title = element_text(size = 10),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+
+
+##----------------------------------------------------------
+## Combine
+##----------------------------------------------------------
+
+combined_pca <- ggarrange(
+  p_background,
+  p_direction,
+  ncol = 2,
+  labels = c("I", "II"),
+  font.label = list(size = 10, face = "bold"),
+  align = "hv")
+
+combined_pca
+```
