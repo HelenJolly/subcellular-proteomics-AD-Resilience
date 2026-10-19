@@ -634,7 +634,7 @@ library(dplyr)
 library(ggplot2)
 library(patchwork)
 
-selection <- c("APP", "NPTX2", "SMOC1") # Figure 3B manuscript exemplars.
+selection <- c("APP", "NPTX2", "SMOC1") 
 
 # ------------------------------------------------------------
 # 1) Log2-intensity summary
@@ -732,7 +732,7 @@ log_prop_plot
 
 ## Figure 3D: Protein-complex profiles
 
-- AP3, dynactin and spliceosomal profiles.
+- AP3, dynactin and spliceosomal profiles
 
 ```{r complex-profiles}
 ribbon_plots_prop <- prop_long %>%
@@ -772,12 +772,10 @@ prop_plot <- ggplot(ribbon_plots_prop, aes(x = Fraction, y = mean_prop,
   panel.border = element_rect(color = "grey", fill = NA, size = 0.8),
 
   strip.text = element_text(colour = "black", size = 10, face = "bold"),
-  strip.background = element_blank(),   # remove grey box
-
-  axis.text.y  = element_blank(),       # remove x tick labels
-  axis.title.y = element_blank(),       # remove x title
-  axis.ticks.y = element_blank(),       # remove ticks
-
+  strip.background = element_blank(),   
+  axis.text.y  = element_blank(),       
+  axis.title.y = element_blank(),       
+  axis.ticks.y = element_blank(),       
   axis.text.x = element_text(size = 10),
   axis.title.x = element_text(size = 10)) +
   scale_color_manual(values = condition_palette) +
@@ -876,8 +874,8 @@ library(ggplot2)
 top_terms <- ego_df %>%
   #filter(Count > 7) %>%
   mutate(
-    theme = case_when(
-      str_detect(Description, regex("snRNP|splice|methylosome", TRUE)) ~ "RNA splicing",
+    theme = case_when( #define broader category for GO terms
+      str_detect(Description, regex("snRNP|splice|RNA", TRUE)) ~ "RNA splicing",
       str_detect(Description, regex("AP-|coat|endosome|retromer|vesicle", TRUE)) ~ "Vesicle trafficking",
       str_detect(Description, regex("axon|projection|presynapse|growth cone", TRUE)) ~ "Neuronal compartment",
       str_detect(Description, regex("microtubule|dynactin", TRUE)) ~ "Cytoskeleton",
@@ -892,7 +890,7 @@ top_terms <- top_terms %>%
   mutate(term = factor(term, levels = unique(term))) %>%
   ungroup()
 
-# ---- 3) Set theme order (important for consistent layout) ----
+# ---- 3) Set theme order  ----
 top_terms$theme <- factor(top_terms$theme, levels = c(
   "RNA splicing",
   "Vesicle trafficking",
