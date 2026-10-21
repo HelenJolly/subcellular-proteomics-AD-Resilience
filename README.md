@@ -49,14 +49,14 @@ Inputs:
 
 ### Disease-associated protein fractionation — Figure 3A–E
 
-`Figure3_Modelling_categorical.Rmd` prepares protein profiles from the imputed and unimputed assays and identifies those eligible for localisation modelling. Relative predictor importance is compared using drop-one-out changes in marginal R2. Disease-associated (CON/RES/AD-DEM) differences in fractionation profiles are identified using mixed models with disease-group x fraction interactions.
+`Figure3_Modelling_DiseaseGpath.Rmd` prepares protein profiles from the imputed and unimputed assays and identifies those eligible for localisation modelling. Relative predictor importance is compared using drop-one-out changes in marginal R2. Disease-associated (CON/RES/AD-DEM) or global pathology (gpath) associated differences in fractionation profiles are identified using mixed models with disease-group/gpath x fraction interactions.
 
 Results are compared between imputed and unimputed analyses to identify robust associations. Example protein profiles and GO Cellular Component enrichment analysis is also included.
 
 Required inputs are:
 - `MAI_prot_model_new.rds` 
 - `demogs.xlsx`
-- `sample_category.csv` can be used in place of demogs for the plotting of fractionation profiles. This allows execution of chunk to plot figures 3B and 3D without requiring restricted external variables.
+- `sample_category.csv` can be used in place of demogs for the plotting of fractionation profiles. This allows execution of chunk to plot figures 3B and 3D without requiring restricted external variables. This only includes CON/RES/AD-DEM mapping. No information on gpath is provided.
  
 ### Resilience-associated protein fractionation — Figure 3F–H
 
