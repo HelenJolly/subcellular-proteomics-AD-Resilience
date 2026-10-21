@@ -5,34 +5,23 @@ output: html_document
 
 ## Summary
 
-This document records the protein-level preprocessing, quality control, and
-imputation workflow used for the manuscript, including the
-run-level PCA in supplementary figure 1. 
-Input quantities are already aggregated to protein groups by DIA-NN; no precursor -> protein aggregation is performed when handling the protein group matrix (pg_matrix)
+This covers the protein-level preprocessing, quality control, and imputation workflow used for the manuscript, including the
+run-level PCA in supplementary figure 1. Note that input quantities are already aggregated to protein groups by DIA-NN. Precursor-level data handling is detailed in Figure5_peptide_analysis.Rmd
 
 ## Data inputs
 
-Run this document from the repository root after configuring `data_dir` and
-`output_dir` below. Required inputs are:
-
-- `full_analysis2/report.pg_matrix.tsv`: DIA-NN output (in PRIDE), the protein-group intensity matrix
-- `Input/mapnamesreport.csv`: has `original_names` and `new_name` columns, which map the experimental layout (plate-well) to subject-fraction (plate-well-subject-fraction) so that technical and individual-level variables can be combined
-- `Input/contaminants.csv`: list of contaminants to exclude with `Accession` and `Gene_symbol`.
+- `report.pg_matrix.tsv`: DIA-NN output (in PRIDE), the protein-group intensity matrix
+- `mapnamesreport.csv`: has `original_names` and `new_name` columns, which map the experimental layout (plate-well) to subject-fraction (plate-well-subject-fraction) so that technical and individual-level variables can be combined
+- `contaminants.csv`: list of contaminants to exclude with `Accession` and `Gene_symbol`.
 - At the end, for the supplementary PCA, a `demogs` dataset containing `Subject`, `Group`(CON/RES/AD/DEM), `age_death`, `pmi`, `study`, and `msex`. It is external to this analysis*
   
-*Subject-level inputs and generated objects are not distributed with the public
-code. ROSMAP participant-level clinical and neuropathological data can be requested through the Rush Alzheimer’s Disease Center at https://www.radc.rush.edu and AD Knowledge Portal at https://www.synapse.org, subject to the applicable data-use agreements. 
+*Subject-level inputs and generated objects are not distributed with the public code. ROSMAP participant-level clinical and neuropathological data can be requested through the Rush Alzheimer’s Disease Center at https://www.radc.rush.edu and AD Knowledge Portal at https://www.synapse.org, subject to the applicable data-use agreements. 
 
 ## Output
 
-`MAI_prot_model_new.rds` is a SummarizedExperiment storing both the unimputed log2-scaled assay,
-`log2Quant` and the imputed log2-scaled assay, `MAI_imputed`, alongside respective protein and run-level metadata. Both assays are 7,271 proteins x 524 runs after QC processing
+`MAI_prot_model_new.rds` is a SummarizedExperiment storing both the unimputed log2-scaled assay, `log2Quant` and the imputed log2-scaled assay, `MAI_imputed`, alongside respective protein and run-level metadata. Both assays are 7,271 proteins x 524 runs after QC processing.
 
-Filtering order, exclusions, transformation, random seed, imputation settings,
-and PCA settings are retained from the original workflow. The original
-session-dependent imputation references are made explicit: `log2_mat` supplies
-`log2Quant`, and `mat` is then extracted from that assay in `se_log2`. This
-connection should be checked against the original analysis object.
+Filtering order, exclusions, transformation, random seed, imputation settings, and PCA settings are detailed.
 
 ## Setup and protein matrix import
 
@@ -50,7 +39,7 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 # 1) Read wide protein matrix
 # - data.table, chosen for wrangling
 # -------------------------------
-f <- file.path(data_dir, "report.pg_matrix.tsv")
+f <- file.path("report.pg_matrix.tsv") #set relevant path
 prot_wide <- as.data.table(read_tsv(f))
 
 #identify metadata columns
@@ -60,7 +49,7 @@ meta_cols <- c(
   "Genes",
   "First.Protein.Description")
 
-# all others columns are LC-MSMS runs
+#all others columns are LC-MSMS runs
 run_cols <- setdiff(names(prot_wide), meta_cols)
 
 # -------------------------------
@@ -90,8 +79,7 @@ tmp <- sub(".*P([0-9]+)_W([0-9]+).*", "\\1;\\2", prot$Run)
 spl <- tstrsplit(tmp, ";")
 prot[, `:=`(
   Plate_num = as.integer(spl[[1]]),
-  Well_num  = as.integer(spl[[2]])
-)]
+  Well_num  = as.integer(spl[[2]]))]
 rm(tmp, spl)
 
 prot[, RunID := paste0("P", Plate_num, "_W", Well_num)]
@@ -100,7 +88,7 @@ prot[, RunID := paste0("P", Plate_num, "_W", Well_num)]
 prot <- prot[RunID != "P7_W17"]
 
 # -------------------------------
-# 4) Map experimental layout (plate-well) to subject-fraction
+# 4) Map experimental layout (plate-well) to subject-fraction (sample)
 # -------------------------------
 mapnames <- fread(file.path(data_dir, "Input", "mapnamesreport.csv"))
 
@@ -122,7 +110,7 @@ prot[, Fraction := sub("p$", "", Fraction)]
 # -------------------------------
 # 5) Remove contaminants
 # -------------------------------
-contaminants <- fread(file.path(data_dir, "contaminants.csv")) #read in from data directory
+contaminants <- fread("contaminants.csv") #read in from relvant directory
 
 # counts BEFORE
 n_prot_before <- uniqueN(prot$Protein.Group)
@@ -144,7 +132,7 @@ n_prot_before; n_prot_after
 print("unique Genes before vs after contaminant removal:")
 n_gene_before; n_gene_after
 
-# drop helper columns
+#drop helper columns
 prot[, c("Run","Plate_num","Well_num") := NULL]
 ```
 ## Sample exclusions and protein filtering
@@ -162,7 +150,7 @@ prot <- prot[
     RunID != "P4-W76-G2-2p" #failed run excluded (>80% missingness)
 ]
 
-# Counts after removal of technical samples
+# counts after removal of technical samples
 n_prot_after <- uniqueN(prot$Protein.Group)
 n_gene_after <- uniqueN(prot$Genes)
 
@@ -201,7 +189,7 @@ uniqueN(prot$Genes)
 prot[, .(mean_missing = mean(is.na(Quant)))] #~0.15%
 ```
 
-## Construct the protein matrix
+## construct the protein matrix
 ```{r construct-long-matrix}
 # -------------------------------
 # 9) Protein-level matrix
@@ -240,7 +228,7 @@ setorder(prot_report, row1, row2, Fraction, Protein.Group)
 # ------------------------------------------------------------
 run_order <- unique(prot_report[, .(RunID, Plate, Well, Subject, Fraction, row1, row2)])
 setorder(run_order, row1, row2, Fraction)
-prot_report[, c("row1", "row2") := NULL] #drop helper columns afterwards
+prot_report[, c("row1", "row2") := NULL] #drop helper columns after
 
 # ------------------------------------------------------------
 # 10) cast to wide protein x run matrix
@@ -268,7 +256,7 @@ assay_mat <- assay_mat[, desired_runs, drop = FALSE]
 rm(prot_report, assay_dt)
 ```
 
-## Log2 transformation and MAI imputation
+## Log2-transformation and MAI imputation
 ```{r transform-and-impute}
 library(data.table)
 library(SummarizedExperiment)
@@ -277,6 +265,7 @@ library(MAI)
 
 # ------------------------------------------------------------
 # 11) log2 transform
+# - log2 quantities are approx. normally distributed
 # ------------------------------------------------------------
 assay_mat[assay_mat <= 0] <- NA_real_ ##assumes Quant is positive intensity, any zeros -> NA
 log2_mat <- log2(assay_mat)
@@ -303,7 +292,7 @@ se_log2 <- SummarizedExperiment(
 
 se_log2 #524 runs (after failed-run exclusion) x 7271 proteins
 ```
-## Mechanism aware imputation
+## Mechanism aware imputation (MAI)
 - MAI is run with `MCAR_algorithm = "BPCA"`, `MNAR_algorithm = "Single"`,
 300 random-forest trees, `proximity = FALSE`, and seed 137690. Both
 unimputed and imputed log2-scaled matrices are retained in the saved SE.
@@ -313,7 +302,7 @@ unimputed and imputed log2-scaled matrices are retained in the saved SE.
 # 14) MAI imputation (mechanism-aware imputation)
 # ------------------------------------------------------------
 #extract matrix from SE
-mat <- assay(se_log2, "log2Quant") #from hereon, use the unimputed assay extracted from the SE
+mat <- assay(se_log2, "log2Quant") 
 
 rm(log2_mat) #original log-scaled matrix can be removed
 
@@ -336,8 +325,7 @@ assay(se_log2, "MAI_imputed") <- imputed
 se_log2
 ```
 
-
-## Save the processed analysis object
+## Save the processed analysis SE object
 
 ```{r save-object}
 # ——————————————————— Now save —————————————————————————
@@ -345,9 +333,8 @@ se_log2
 ```
 ## Supplementary run-level PCA
 
-This chunk produces the supplementary S1 PCA figure. Datapoints are coloured by fraction,
-plate, pre-imputation missingness, sex, age at death, and post-mortem interval.
-This requires the external restricted `demogs` dataset specified at the beginning*
+The below chunk produces the supplementary S1 PCA figure. Datapoints are coloured by fraction,
+plate, pre-imputation missingness, sex, age at death, and post-mortem interval. This requires the external restricted `demogs` dataset specified at the beginning*
 
 ```{r supplementary-pca}
 library(SummarizedExperiment)
@@ -385,13 +372,13 @@ sum(is.na(mat_imputed))
 prop_na <- colMeans(is.na(mat_unimputed))
 
 # ============================================================
-# 3. Remove proteins unsuitable for PCA
+# 3. checks
 # ============================================================
 
-# Retain proteins with finite values across all runs
+# retain proteins with finite values across all runs
 keep_complete <- rowSums(!is.finite(mat_imputed)) == 0
 
-# Remove proteins with zero variance across runs
+# remove proteins with zero variance across runs
 protein_var <- apply(mat_imputed, 1, var, na.rm = TRUE)
 keep_variable <- is.finite(protein_var) & protein_var > 0
 
@@ -400,7 +387,7 @@ mat_pca <- mat_imputed[keep_complete & keep_variable, , drop = FALSE]
 dim(mat_pca)
 
 # ============================================================
-# 4. Run PCA
+# 4. PCA
 # ============================================================
 
 pca <- prcomp(
@@ -417,7 +404,7 @@ pc1_var
 pc2_var
 
 # ============================================================
-# 5. Assemble sample-level metadata
+# 5. combine with sample-level metadata
 # ============================================================
 
 run_pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
@@ -615,7 +602,7 @@ p_pmi <- ggplot(
     legend.direction = "horizontal")
 
 # ============================================================
-# 8. Combine panels
+# 8. combine panels
 # ============================================================
 
 pca_figure <- (p_fraction + p_plate) / 
