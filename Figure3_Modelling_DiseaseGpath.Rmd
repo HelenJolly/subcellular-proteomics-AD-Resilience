@@ -979,3 +979,169 @@ CC_plot <- ggplot(top_terms, aes(x = Strength, y = term)) +
     legend.position = "right")
 CC_plot
 ```
+
+### Global pathology model
+- This replaces CON/RES/AD with a scaled continuous measure of global pathology
+
+```{r}
+library(lme4)
+library(dplyr)
+library(performance)
+library(tibble)
+
+fit_fraction_pathology_models <- function( #these are the default settings
+    gene_list, dataframe,
+    assay_to_use = c("imputed", "unimputed"),
+    dataset_label = NULL,
+    feature_var = "Genes",
+    response_var = "log2_value",
+    pathology_var = "gpath",
+    fraction_var = "Fraction",
+    subject_var = "Subject",
+    sex_var = "msex",
+    continuous_vars = c("age_death", "pmi"),
+    fraction_levels = as.character(1:7),
+    scale_continuous = TRUE,
+    include_covariate_fraction_interactions = TRUE,
+    min_rows = 10,
+    fdr_method = "BH") {
+  
+  assay_to_use <- match.arg(assay_to_use)
+  if (is.null(dataset_label)) dataset_label <- assay_to_use
+  
+  df0 <- dataframe %>%
+    filter(assay_type == assay_to_use) %>%
+    mutate( #catgegorical variables as factors
+      !!fraction_var := factor(.data[[fraction_var]], levels = fraction_levels),
+      !!subject_var := factor(.data[[subject_var]]),
+      !!sex_var := factor(.data[[sex_var]]))
+  
+  #scale pathology + continuous covariates
+  if (scale_continuous) { #scale and paste z on the end
+    df0[[paste0(pathology_var, "_z")]] <- as.numeric(scale(df0[[pathology_var]]))
+    #repeat for all other continuous vars
+    z_names <- paste0(continuous_vars, "_z")
+    for (i in seq_along(continuous_vars)) {
+      v <- continuous_vars[i]
+      vz <- z_names[i]
+      df0[[vz]] <- as.numeric(scale(df0[[v]]))
+    }
+    
+    pathology_term <- paste0(pathology_var, "_z")
+    cont_terms <- z_names
+  } else {
+    pathology_term <- pathology_var
+    cont_terms <- continuous_vars
+  }
+  #main covariates are pathology, age, pmi and sex
+  main_cov_terms <- c(pathology_term, cont_terms, sex_var)
+  
+  if (include_covariate_fraction_interactions) {
+    frac_cov_terms <- c(
+      paste0(pathology_term, ":", fraction_var),
+      paste0(cont_terms, ":", fraction_var),
+      paste0(sex_var, ":", fraction_var))
+  } else {
+    frac_cov_terms <- character(0)
+  }
+  
+  # reduced model excludes pathology:fraction
+  reduced_terms <- c(fraction_var, pathology_term, cont_terms, sex_var)
+  if (include_covariate_fraction_interactions) {
+    reduced_terms <- c(
+      fraction_var,
+      pathology_term,
+      cont_terms,
+      sex_var,
+      paste0(cont_terms, ":", fraction_var),
+      paste0(sex_var, ":", fraction_var))
+  }
+  
+  # full model adds pathology:fraction
+  full_terms <- c(
+    reduced_terms,
+    paste0(pathology_term, ":", fraction_var))
+  
+  reduced_formula <- as.formula(
+    paste(response_var, "~", paste(reduced_terms, collapse = " + "),
+          "+ (1 |", subject_var, ")"))
+  
+  full_formula <- as.formula(
+    paste(response_var, "~", paste(full_terms, collapse = " + "),
+          "+ (1 |", subject_var, ")"))
+  
+  results <- vector("list", length(gene_list))
+  names(results) <- gene_list
+  
+  for (gene in gene_list) {
+    dat_g <- df0 %>%
+      filter(.data[[feature_var]] == gene) %>%
+      filter(
+        !is.na(.data[[response_var]]),
+        !is.na(.data[[fraction_var]]),
+        !is.na(.data[[subject_var]]),
+        !is.na(.data[[sex_var]]),
+        !is.na(.data[[pathology_term]]))
+    
+    for (v in cont_terms) {
+      dat_g <- dat_g %>% filter(!is.na(.data[[v]]))
+    }
+    
+    if (nrow(dat_g) < min_rows || nlevels(dat_g[[fraction_var]]) < 2) next
+    
+    model_noint <- try(
+      lmer(reduced_formula, data = dat_g, REML = FALSE),
+      silent = TRUE)
+    
+    model_full <- try(
+      lmer(full_formula, data = dat_g, REML = FALSE),
+      silent = TRUE)
+    
+    if (inherits(model_noint, "try-error") || inherits(model_full, "try-error")) next
+    if (any(is.na(fixef(model_full)))) next
+    
+    an <- try(anova(model_noint, model_full), silent = TRUE)
+    if (inherits(an, "try-error")) next
+    
+    pval <- an$`Pr(>Chisq)`[2]
+    chisq <- an$Chisq[2]
+    if (is.na(pval)) next
+    
+    r2_noint <- suppressWarnings(r2_nakagawa(model_noint)$R2_marginal)
+    r2_full  <- suppressWarnings(r2_nakagawa(model_full)$R2_marginal)
+    
+    results[[gene]] <- tibble(
+      Genes = gene,
+      dataset = dataset_label,
+      pathology_variable = pathology_var,
+      n_obs = nrow(dat_g),
+      n_subjects = n_distinct(dat_g[[subject_var]]),
+      chi_sq = chisq,
+      p_value = pval,
+      delta_margin_r2 = r2_full - r2_noint,
+      singular_reduced = isSingular(model_noint, tol = 1e-4),
+      singular_full = isSingular(model_full, tol = 1e-4))
+  }
+  
+  out <- bind_rows(results) %>%
+    mutate(padj = p.adjust(p_value, method = fdr_method)) %>%
+    arrange(padj, p_value)
+  
+  list(
+    full_list_mixmod = out,
+    significant_mixmod = out %>% filter(padj < 0.05))
+}
+
+res_gpath_unimp <- fit_fraction_pathology_models(
+  gene_list = model_gene_list,
+  dataframe = prop_long,
+  assay_to_use = "imputed",
+  dataset_label = "imputed",
+  pathology_var = "gpath",
+  scale_continuous = TRUE)
+
+res_gpath_unimp$significant_mixmod %>% arrange(desc(delta_margin_r2))
+
+#write_csv(res_gpath_unimp$full_list_mixmod, "~/Documents/DPhil_Project/writeup/imp_gpath_results.csv")
+```
+
