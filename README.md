@@ -7,7 +7,7 @@ Analysis code accompanying the study of subcellular proteomics in ROSMAP samples
 | --- | --- | --- |
 | `protein_matrix_QC.Rmd` | Protein-level filtering, log2 transformation, MAI imputation, SummarizedExperiment (SE) storage and run-level PCA | Processed protein matrix, SE object, and Supplementary Figure S1 |
 | `Figure2_subcell_profiles.Rmd` | Protein fractionation profile clustering, GO:CC enrichment, curated marker profile visualisation, t-SNE and within-group subject correlations | Figure 2A, 2C, 2D and Supplementary Figure S2 |
-| `Figure3_Modelling_categorical.Rmd` | Relative predictor importance, disease-by-fraction mixed models, comparison of imputed and unimputed results, protein profiles and GO:CC enrichment | Figure 3A–E |
+| `Figure3_Modelling_DiseaseGpath.Rmd` | Relative predictor importance, disease-by-fraction mixed models, comparison of imputed and unimputed results, protein profiles and GO:CC enrichment, global pathology-by-fraction mixed models | Figure 3A–E |
 | `Figure3_Modelling_Resilience.Rmd` | Longitudinal cognition modelling, derivation of resilience scores and resilience-by-fraction mixed models | Figure 3F–H |
 | `Figure5_peptide_analysis.Rmd` | Peptide-level filtering, MAPT peptide inspection, mapping, and plotting | Figure 5 |
 | `TAGM_Subject.R` | Within-subject TAGM-MAP compartment prediction using curated subcellular markers | Pre-requisite for OOS prediction and Figure 6 |
