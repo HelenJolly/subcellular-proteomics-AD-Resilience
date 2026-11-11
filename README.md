@@ -18,6 +18,9 @@ Analysis code accompanying the study of subcellular proteomics in ROSMAP samples
 This repository contains analysis code, not restricted participant-level data.
 The code can be inspected without the input data; several elements of execution require authorised access to the restricted metadata. This is subject to the applicable data-use agreements, through [Rush Alzheimer's Disease Center](https://www.radc.rush.edu) and [Synapse](https://www.synapse.org).
 
+The mass spectrometry proteomics data have been deposited to the ProteomeXchange Consortium via the PRIDE [1] partner repository with the dataset identifier PXD086302. 
+[1] Perez-Riverol Y, et al., The PRIDE database at 20 years: 2025 update. Nucleic Acids Res. 2025 Jan 6;53(D1):D543-D553. doi: 10.1093/nar/gkae1011. PMID: 39494541
+
 ## Protein matrix QC workflow
 
 The script imports DIA-NN protein-group intensities, maps runs to the experimental layout, removes excluded samples and contaminants, filters proteins with at least 70% missingness, removes entries listing multiple accessions or genes, transforms intensities to log2 scale, and applies MAI imputation.
